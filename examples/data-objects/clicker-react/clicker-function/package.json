@@ -55,7 +55,7 @@
     "@types/react": "^16.9.15",
     "@types/react-dom": "^16.9.4",
     "@typescript-eslint/eslint-plugin": "~4.14.0",
-    "@typescript-eslint/parser": "~4.14.0",
+    "@typescript-eslint/parser": "~4.28.0",
     "concurrently": "^5.2.0",
     "cross-env": "^7.0.2",
     "eslint": "~7.18.0",
