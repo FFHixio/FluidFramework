@@ -38,7 +38,7 @@
     "@fluidframework/server-services-client": "^0.1026.0-0",
     "@fluidframework/server-services-core": "^0.1026.0-0",
     "@fluidframework/server-services-shared": "^0.1026.0-0",
-    "@fluidframework/server-services-utils": "^0.1026.0-0",
+    "@fluidframework/server-services-utils": "^0.1026.0",
     "@fluidframework/server-test-utils": "^0.1026.0-0",
     "axios": "^0.21.1",
     "body-parser": "^1.17.1",
