@@ -164,7 +164,7 @@
     "eslint-plugin-unicorn": "~26.0.1",
     "file-loader": "^3.0.1",
     "fork-ts-checker-webpack-plugin": "^0.4.9",
-    "html-loader": "^0.5.5",
+    "html-loader": "^1.0.0",
     "less": "~3.9.0",
     "mocha": "^8.4.0",
     "node-sass": "^4.9.3",
