@@ -4,18 +4,17 @@
  */
 
 import * as SearchMenu from "@fluid-example/search-menu";
-import * as api from "@fluid-internal/client-api";
 import { performance } from "@fluidframework/common-utils";
 import {
     IFluidObject,
     IFluidHandle,
     IFluidLoadable,
 } from "@fluidframework/core-interfaces";
-import { IFluidObjectCollection } from "@fluid-example/fluid-object-interfaces";
+import { IFluidDataStoreRuntime } from "@fluidframework/datastore-definitions";
 import * as types from "@fluidframework/map";
 import * as MergeTree from "@fluidframework/merge-tree";
 import { IClient, ISequencedDocumentMessage, IUser } from "@fluidframework/protocol-definitions";
-import { IInboundSignalMessage } from "@fluidframework/runtime-definitions";
+import { IFluidDataStoreContext, IInboundSignalMessage } from "@fluidframework/runtime-definitions";
 import * as Sequence from "@fluidframework/sequence";
 import { SharedSegmentSequenceUndoRedoHandler, UndoRedoStackManager } from "@fluidframework/undo-redo";
 import { HTMLViewAdapter } from "@fluidframework/view-adapters";
@@ -40,10 +39,6 @@ interface IPersistentElement extends HTMLDivElement {
     component: IFluidObject;
 }
 
-interface IMathViewMarker extends MergeTree.Marker {
-    instance?: IMathInstance;
-}
-
 function getComponentBlock(marker: MergeTree.Marker): IBlockViewMarker {
     if (marker && marker.properties && marker.properties.crefTest) {
         const crefTest: IReferenceDoc = marker.properties.crefTest;
@@ -61,29 +56,6 @@ interface IBlockViewMarker extends MergeTree.Marker {
 interface IFluidViewMarker extends MergeTree.Marker {
     instanceP?: Promise<IFluidHTMLView>;
     instance?: IFluidHTMLView;
-}
-
-interface IMathCollection extends IFluidLoadable {
-    createCollectionItem(options?: IMathOptions): IMathInstance;
-    getInstance(id: string, options?: IMathOptions): IMathInstance;
-}
-
-// The following interfaces should come from the math component but are
-// here due to package dependencies
-
-interface IMathOptions {
-    display: string;
-}
-
-export interface IMathInstance extends IFluidLoadable, IFluidHTMLView, IViewCursor,
-    IKeyHandlers, IViewLayout, SearchMenu.ISearchMenuClient {
-    IFluidLoadable: IFluidLoadable;
-    IViewCursor: IViewCursor;
-    IKeyHandlers: IKeyHandlers;
-    IViewLayout: IViewLayout;
-    ISearchMenuClient: SearchMenu.ISearchMenuClient;
-    id: string;
-    leafId: string;
 }
 
 export interface IFlowViewUser extends IUser {
@@ -422,7 +394,7 @@ const commands: IFlowViewCmd[] = [
     {
         exec: (c, p, f) => {
             f.updatePGInfo(f.cursor.pos - 1);
-            Table.createTable(f.cursor.pos, f.sharedString, f.collabDocument.clientId);
+            Table.createTable(f.cursor.pos, f.sharedString, f.runtime.clientId);
             f.hostSearchMenu(f.cursor.pos);
         },
         key: "table test",
@@ -475,30 +447,6 @@ const commands: IFlowViewCmd[] = [
             f.insertComponentNew("code", "@fluid-example/monaco");
         },
         key: "insert new monaco",
-    },
-    {
-        exec: (c, p, f) => {
-            f.insertMath();
-        },
-        key: "insert math",
-    },
-    {
-        exec: (c, p, f) => {
-            f.insertMath(false);
-        },
-        key: "insert math block",
-    },
-    {
-        exec: (c, p, f) => {
-            f.insertNewCollectionComponent(f.images);
-        },
-        key: "insert image",
-    },
-    {
-        exec: (c, p, f) => {
-            f.insertNewCollectionComponent(f.progressBars);
-        },
-        key: "insert progress bar",
     },
     {
         exec: (c, p, f) => {
@@ -558,9 +506,6 @@ interface ILineContext {
     flowView: FlowView;
     span: ISegSpan;
     deferredAttach?: boolean;
-    mathSegpos?: number;
-    mathMode: boolean;
-    mathBuffer: string;
     reRenderList?: ILineDiv[];
     pgMarker: Paragraph.IParagraphMarker;
 }
@@ -728,17 +673,6 @@ function allowDOMEvents(element: HTMLElement) {
     return element;
 }
 
-interface IMathEndMarker extends MergeTree.Marker {
-    outerSpan: HTMLSpanElement;
-}
-
-function isMathComponentView(marker: MergeTree.Marker) {
-    if (marker.hasProperty("crefTest")) {
-        const refInfo = marker.properties.crefTest as IReferenceDoc;
-        return refInfo.type.name === "math";
-    }
-}
-
 function isComponentView(marker: MergeTree.Marker) {
     if (marker.hasProperty("crefTest")) {
         const refInfo = marker.properties.crefTest as IReferenceDoc;
@@ -757,33 +691,27 @@ function renderSegmentIntoLine(
         lineContext.lineDiv.lineEnd = lineContext.lineDiv.linePos;
     }
     if (MergeTree.TextSegment.is(segment)) {
-        if (lineContext.mathMode) {
-            // Will be whole segment
-            // TODO: show math box if cursor in math
-            lineContext.mathBuffer += segment.text;
-        } else {
-            if (_start < 0) {
-                _start = 0;
-            }
-            if (_end > segment.cachedLength) {
-                _end = segment.cachedLength;
-            }
-            const text = segment.text.substring(_start, _end);
-            const textStartPos = segpos + _start;
-            const textEndPos = segpos + _end;
-            lineContext.span = makeSegSpan(lineContext.flowView, text, segment, _start, segpos);
-            if ((lineContext.lineDiv.endPGMarker) && (lineContext.lineDiv.endPGMarker.properties.header)) {
-                lineContext.span.style.color = wordHeadingColor;
-            }
-            lineContext.contentDiv.appendChild(lineContext.span);
-            lineContext.lineDiv.lineEnd += text.length;
-            if ((lineContext.flowView.cursor.pos >= textStartPos) && (lineContext.flowView.cursor.pos <= textEndPos)) {
-                showPositionInLine(lineContext, textStartPos, text, lineContext.flowView.cursor.pos);
-            }
-            const presenceInfo = lineContext.flowView.presenceInfoInRange(textStartPos, textEndPos);
-            if (presenceInfo) {
-                showPositionInLine(lineContext, textStartPos, text, presenceInfo.xformPos, presenceInfo);
-            }
+        if (_start < 0) {
+            _start = 0;
+        }
+        if (_end > segment.cachedLength) {
+            _end = segment.cachedLength;
+        }
+        const text = segment.text.substring(_start, _end);
+        const textStartPos = segpos + _start;
+        const textEndPos = segpos + _end;
+        lineContext.span = makeSegSpan(lineContext.flowView, text, segment, _start, segpos);
+        if ((lineContext.lineDiv.endPGMarker) && (lineContext.lineDiv.endPGMarker.properties.header)) {
+            lineContext.span.style.color = wordHeadingColor;
+        }
+        lineContext.contentDiv.appendChild(lineContext.span);
+        lineContext.lineDiv.lineEnd += text.length;
+        if ((lineContext.flowView.cursor.pos >= textStartPos) && (lineContext.flowView.cursor.pos <= textEndPos)) {
+            showPositionInLine(lineContext, textStartPos, text, lineContext.flowView.cursor.pos);
+        }
+        const presenceInfo = lineContext.flowView.presenceInfoInRange(textStartPos, textEndPos);
+        if (presenceInfo) {
+            showPositionInLine(lineContext, textStartPos, text, presenceInfo.xformPos, presenceInfo);
         }
     } else if (MergeTree.Marker.is(segment)) {
         // Console.log(`marker pos: ${segpos}`);
@@ -792,16 +720,7 @@ function renderSegmentIntoLine(
         // component.
         if (segment.refType === MergeTree.ReferenceType.Simple) {
             const marker = segment;
-            if (isMathComponentView(marker)) {
-                const span = document.createElement("span");
-                const mathViewMarker = marker as IMathViewMarker;
-                if (!mathViewMarker.instance) {
-                    lineContext.flowView.loadMath(mathViewMarker);
-                }
-                mathViewMarker.instance.render(span);
-                mathViewMarker.properties.cachedElement = span;
-                lineContext.contentDiv.appendChild(span);
-            } else if (isComponentView(marker)) {
+            if (isComponentView(marker)) {
                 const span = document.createElement("span");
                 const componentMarker = marker as IFluidViewMarker;
 
@@ -811,7 +730,7 @@ function renderSegmentIntoLine(
                         // eslint-disable-next-line @typescript-eslint/no-floating-promises
                         handleFromLegacyUri(
                             `/${componentMarker.properties.leafId}`,
-                            lineContext.flowView.collabDocument.context.containerRuntime)
+                            lineContext.flowView.context.containerRuntime)
                         .get()
                         .then(async (component) => {
                             if (!HTMLViewAdapter.canAdapt(component)) {
@@ -896,8 +815,6 @@ function reRenderLine(lineDiv: ILineDiv, flowView: FlowView, docContext: IDocume
             lineDiv,
             lineDivHeight,
             markerPos: 0,
-            mathBuffer: "",
-            mathMode: false,
             outerViewportBounds,
             pgMarker: undefined,
             span: undefined,
@@ -1089,7 +1006,7 @@ function showBookmarks(
     if (flowView.bookmarks || flowView.comments || sel || havePresenceSel) {
         const computedEnd = lineEnd;
         const bookmarks = flowView.bookmarks.findOverlappingIntervals(lineStart, computedEnd);
-        const comments = flowView.commentsView.findOverlappingIntervals(lineStart, computedEnd);
+        const comments = flowView.comments.findOverlappingIntervals(lineStart, computedEnd);
         const lineText = flowView.sharedString.getText(lineStart, computedEnd);
         if (sel && ((sel.start < lineEnd) && (sel.end > lineStart))) {
             showBookmark(flowView, undefined, lineText, sel.start, sel.end, lineStart, endPGMarker,
@@ -2187,7 +2104,7 @@ function renderFlow(layoutContext: ILayoutContext, targetTranslation: string, de
                 }
                 const lineContext = {
                     contentDiv, deferredAttach: layoutContext.deferredAttach, flowView: layoutContext.flowView,
-                    lineDiv, lineDivHeight, mathBuffer: "", mathMode: false, pgMarker: endPGMarker, span,
+                    lineDiv, lineDivHeight, pgMarker: endPGMarker, span,
                 } as ILineContext;
                 if (viewportStartPos < 0) {
                     viewportStartPos = lineStart;
@@ -2258,97 +2175,83 @@ function renderFlow(layoutContext: ILayoutContext, targetTranslation: string, de
 
         const newBlock = getComponentBlock(asMarker);
         if (newBlock) {
-            const refDoc = newBlock.properties.crefTest as IReferenceDoc;
             let ch: number;
-            if (refDoc.type.name === "math") {
-                const minWidth = `${Math.round(0.75 * parseInt(layoutContext.viewport.div.style.width, 10))}px`;
-                const minHeight = `${Math.round(0.33 * parseInt(layoutContext.viewport.div.style.width, 10))}px`;
-                if (!newBlock.instance) {
-                    // For now, use math; later need to load route async
-                    layoutContext.flowView.loadMath(newBlock as IMathViewMarker);
+            if (newBlock.instance) {
+                let wpct = 0.75;
+                const layout = newBlock.instance.IViewLayout;
+                if (layout && layout.requestedWidthPercentage) {
+                    wpct = layout.requestedWidthPercentage;
                 }
-                const blockDiv = makeBlockDiv(0, layoutContext.viewport.getLineTop(), minWidth, minHeight);
-                blockDiv.style.width = minWidth;
-                newBlock.instance.render(blockDiv, { display: "block" });
-                ch = blockDiv.getBoundingClientRect().height;
-            } else {
-                if (newBlock.instance) {
-                    let wpct = 0.75;
-                    const layout = newBlock.instance.IViewLayout;
-                    if (layout && layout.requestedWidthPercentage) {
-                        wpct = layout.requestedWidthPercentage;
-                    }
-                    const width = `${Math.round(wpct * parseInt(layoutContext.viewport.div.style.width, 10))}px`;
-                    const minHeight = `${Math.round(0.33 * parseInt(layoutContext.viewport.div.style.height, 10))}px`;
-                    if (layout && layout.preferPersistentElement) {
-                        const persistentComponent = layoutContext.flowView.getPersistentComponent(newBlock.instance);
-                        let absBlockDiv: HTMLDivElement;
-                        if (!persistentComponent) {
-                            absBlockDiv =
-                                makePersistentElement(0, layoutContext.viewport.getLineTop(), width, minHeight);
-                            layoutContext.flowView.addPersistentComponent(absBlockDiv, newBlock.instance);
-                        } else {
-                            absBlockDiv = persistentComponent.elm;
-                        }
-                        const measureDiv = document.createElement("div");
-                        layoutContext.viewport.div.appendChild(measureDiv);
-                        const bounds = measureDiv.getBoundingClientRect();
-                        layoutContext.viewport.div.removeChild(measureDiv);
-                        absBlockDiv.style.left = "0px";
-                        absBlockDiv.style.top = `${Math.round(bounds.top)}px`;
-                        if ((!layout) || (!layout.variableHeight)) {
-                            absBlockDiv.style.height = minHeight;
-                        }
-                        absBlockDiv.style.width = width;
-                        absBlockDiv.style.display = "block";
-                        newBlock.instance.render(absBlockDiv, { display: "block" });
-                        // Cache this in flow view
-                        ch = absBlockDiv.getBoundingClientRect().height;
+                const width = `${Math.round(wpct * parseInt(layoutContext.viewport.div.style.width, 10))}px`;
+                const minHeight = `${Math.round(0.33 * parseInt(layoutContext.viewport.div.style.height, 10))}px`;
+                if (layout && layout.preferPersistentElement) {
+                    const persistentComponent = layoutContext.flowView.getPersistentComponent(newBlock.instance);
+                    let absBlockDiv: HTMLDivElement;
+                    if (!persistentComponent) {
+                        absBlockDiv =
+                            makePersistentElement(0, layoutContext.viewport.getLineTop(), width, minHeight);
+                        layoutContext.flowView.addPersistentComponent(absBlockDiv, newBlock.instance);
                     } else {
-                        const blockDiv = makeBlockDiv(0, layoutContext.viewport.getLineTop(), width, minHeight);
-                        blockDiv.style.width = width;
-                        if ((!layout) || (!layout.variableHeight)) {
-                            blockDiv.style.height = minHeight;
-                        }
-                        newBlock.instance.render(blockDiv, { display: "block" });
-                        // Cache this in FlowView
-                        ch = blockDiv.getBoundingClientRect().height;
-                        console.log(`block height ${ch}`);
+                        absBlockDiv = persistentComponent.elm;
                     }
+                    const measureDiv = document.createElement("div");
+                    layoutContext.viewport.div.appendChild(measureDiv);
+                    const bounds = measureDiv.getBoundingClientRect();
+                    layoutContext.viewport.div.removeChild(measureDiv);
+                    absBlockDiv.style.left = "0px";
+                    absBlockDiv.style.top = `${Math.round(bounds.top)}px`;
+                    if ((!layout) || (!layout.variableHeight)) {
+                        absBlockDiv.style.height = minHeight;
+                    }
+                    absBlockDiv.style.width = width;
+                    absBlockDiv.style.display = "block";
+                    newBlock.instance.render(absBlockDiv, { display: "block" });
+                    // Cache this in flow view
+                    ch = absBlockDiv.getBoundingClientRect().height;
                 } else {
-                    // Delay load the instance if not available
-                    // eslint-disable-next-line @typescript-eslint/no-misused-promises
-                    if (!newBlock.instanceP) {
-                        newBlock.instanceP = newBlock.properties.leafId.get()
-                            .then(async (component: IFluidObject) => {
-                                // TODO below is a temporary workaround. Should every QI interface also implement
-                                // IFluidObject. Then you can go from IFluidHTMLView to IViewLayout.
-                                // Or should you query for each one individually.
-                                if (!HTMLViewAdapter.canAdapt(component)) {
-                                    return Promise.reject(new Error("component is not viewable"));
-                                }
-
-                                return new HTMLViewAdapter(component);
-                            });
-
-                        // eslint-disable-next-line @typescript-eslint/no-floating-promises
-                        newBlock.instanceP.then((instance) => {
-                            newBlock.instance = instance;
-                            const compPos = getPosition(layoutContext.flowView, asMarker);
-                            layoutContext.flowView.hostSearchMenu(compPos);
-                        });
+                    const blockDiv = makeBlockDiv(0, layoutContext.viewport.getLineTop(), width, minHeight);
+                    blockDiv.style.width = width;
+                    if ((!layout) || (!layout.variableHeight)) {
+                        blockDiv.style.height = minHeight;
                     }
-
-                    ch = 10;
-                    const lineDiv = makeLineDiv(
-                        new ui.Rectangle(
-                            0,
-                            layoutContext.viewport.getLineTop(),
-                            parseInt(layoutContext.viewport.div.style.width, 10),
-                            ch),
-                        layoutContext.docContext.fontstr);
-                    lineDiv.style.backgroundColor = "red";
+                    newBlock.instance.render(blockDiv, { display: "block" });
+                    // Cache this in FlowView
+                    ch = blockDiv.getBoundingClientRect().height;
+                    console.log(`block height ${ch}`);
                 }
+            } else {
+                // Delay load the instance if not available
+                // eslint-disable-next-line @typescript-eslint/no-misused-promises
+                if (!newBlock.instanceP) {
+                    newBlock.instanceP = newBlock.properties.leafId.get()
+                        .then(async (component: IFluidObject) => {
+                            // TODO below is a temporary workaround. Should every QI interface also implement
+                            // IFluidObject. Then you can go from IFluidHTMLView to IViewLayout.
+                            // Or should you query for each one individually.
+                            if (!HTMLViewAdapter.canAdapt(component)) {
+                                return Promise.reject(new Error("component is not viewable"));
+                            }
+
+                            return new HTMLViewAdapter(component);
+                        });
+
+                    // eslint-disable-next-line @typescript-eslint/no-floating-promises
+                    newBlock.instanceP.then((instance) => {
+                        newBlock.instance = instance;
+                        const compPos = getPosition(layoutContext.flowView, asMarker);
+                        layoutContext.flowView.hostSearchMenu(compPos);
+                    });
+                }
+
+                ch = 10;
+                const lineDiv = makeLineDiv(
+                    new ui.Rectangle(
+                        0,
+                        layoutContext.viewport.getLineTop(),
+                        parseInt(layoutContext.viewport.div.style.width, 10),
+                        ch),
+                    layoutContext.docContext.fontstr);
+                lineDiv.style.backgroundColor = "red";
             }
 
             layoutContext.viewport.vskip(ch);
@@ -2471,15 +2374,6 @@ function renderFlow(layoutContext: ILayoutContext, targetTranslation: string, de
         viewportEndPos,
         viewportStartPos,
     };
-}
-
-function makeMathSpan(mathSegpos: number, offsetFromSegpos: number) {
-    const span = document.createElement("span") as ISegSpan;
-    span.segPos = mathSegpos;
-    if (offsetFromSegpos > 0) {
-        span.offset = offsetFromSegpos;
-    }
-    return span;
 }
 
 function makeSegSpan(
@@ -3007,10 +2901,9 @@ export class FlowView extends ui.Component implements SearchMenu.ISearchMenuHost
     public wheelTicking = false;
     public topChar = -1;
     public cursor: FlowCursor;
-    public bookmarks: Sequence.IntervalCollectionView<Sequence.SequenceInterval>;
+    public bookmarks: Sequence.IntervalCollection<Sequence.SequenceInterval>;
     public tempBookmarks: Sequence.SequenceInterval[];
     public comments: Sequence.IntervalCollection<Sequence.SequenceInterval>;
-    public commentsView: Sequence.IntervalCollectionView<Sequence.SequenceInterval>;
     public sequenceTest: Sequence.SharedNumberSequence;
     public persistentComponents: Map<IFluidObject, PersistentComponent>;
     public sequenceObjTest: Sequence.SharedObjectSequence<ISeqTestItem>;
@@ -3033,9 +2926,6 @@ export class FlowView extends ui.Component implements SearchMenu.ISearchMenuHost
     public keypressHandler: (e: KeyboardEvent) => void;
     public keydownHandler: (e: KeyboardEvent) => void;
 
-    public images: IFluidObjectCollection;
-    public progressBars: IFluidObjectCollection;
-
     // TODO: 'services' is being used temporarily to smuggle context down to components.
     //       Should be replaced w/component-standardized render context, layout context, etc.
     public services = new Map<string, any>();
@@ -3050,8 +2940,6 @@ export class FlowView extends ui.Component implements SearchMenu.ISearchMenuHost
     private readonly cmdTree: MergeTree.TST<IFlowViewCmd>;
     private formatRegister: MergeTree.PropertySet;
 
-    private math: IMathCollection;
-
     // A list of Marker segments modified by the most recently processed op.  (Reset on each
     // sequenceDelta event.)  Used by 'updatePgInfo()' to determine if table information
     // may have been invalidated.
@@ -3061,7 +2949,8 @@ export class FlowView extends ui.Component implements SearchMenu.ISearchMenuHost
 
     constructor(
         element: HTMLDivElement,
-        public collabDocument: api.Document,
+        public readonly runtime: IFluidDataStoreRuntime,
+        public readonly context: IFluidDataStoreContext,
         public sharedString: Sequence.SharedString,
         public status: Status,
         public options?: Record<string, any>) {
@@ -3109,23 +2998,20 @@ export class FlowView extends ui.Component implements SearchMenu.ISearchMenuHost
         });
 
         // Refresh cursors when clients join or leave
-        collabDocument.runtime.getQuorum().on("addMember", () => {
+        runtime.getQuorum().on("addMember", () => {
             this.updatePresenceCursors();
             this.broadcastPresence();
         });
-        collabDocument.runtime.getQuorum().on("removeMember", () => {
+        runtime.getQuorum().on("removeMember", () => {
             this.updatePresenceCursors();
         });
-        collabDocument.runtime.getAudience().on("addMember", () => {
+        runtime.getAudience().on("addMember", () => {
             this.updatePresenceCursors();
             this.broadcastPresence();
         });
-        collabDocument.runtime.getAudience().on("removeMember", () => {
+        runtime.getAudience().on("removeMember", () => {
             this.updatePresenceCursors();
         });
-
-        // eslint-disable-next-line @typescript-eslint/no-floating-promises
-        this.openCollections();
 
         this.cursor = new FlowCursor(this.viewportDiv);
         this.setViewOption(this.options);
@@ -3142,9 +3028,6 @@ export class FlowView extends ui.Component implements SearchMenu.ISearchMenuHost
             console.log("Component invalidated layout");
             this.hostSearchMenu(FlowView.docStartPosition);
         });
-
-        // Provide access to the containing shared object
-        this.services.set("document", this.collabDocument);
     }
 
     // Remember an element to give to a component; element will be absolutely positioned during render, if needed
@@ -3183,12 +3066,17 @@ export class FlowView extends ui.Component implements SearchMenu.ISearchMenuHost
         flowElement: HTMLDivElement,
         flowRect: IExcludedRectangle,
         marker: MergeTree.Marker) {
-        const childFlow = new FlowView(flowElement, this.collabDocument, this.sharedString,
-            this.status, this.options);
+        const childFlow = new FlowView(
+            flowElement,
+            this.runtime,
+            this.context,
+            this.sharedString,
+            this.status,
+            this.options,
+        );
         childFlow.parentFlow = this;
         childFlow.setEdit(this.docRoot);
         childFlow.comments = this.comments;
-        childFlow.commentsView = this.commentsView;
         childFlow.presenceSignal = this.presenceSignal;
         childFlow.presenceVector = this.presenceVector;
         childFlow.bookmarks = this.bookmarks;
@@ -3222,7 +3110,7 @@ export class FlowView extends ui.Component implements SearchMenu.ISearchMenuHost
         for (let i = 0; i < k; i++) {
             const pos1 = Math.floor(Math.random() * (len - 1));
             const intervalLen = Math.max(1, Math.floor(Math.random() * Math.min(len - pos1, 150)));
-            const props = { clid: this.collabDocument.clientId };
+            const props = { clid: this.runtime.clientId };
             this.bookmarks.add(pos1, pos1 + intervalLen, MergeTree.IntervalType.SlideOnRemove, props);
         }
         this.hostSearchMenu(-1);
@@ -3585,8 +3473,6 @@ export class FlowView extends ui.Component implements SearchMenu.ISearchMenuHost
                         if (marker.hasRangeLabel("table") && (marker.refType & MergeTree.ReferenceType.NestEnd)) {
                             this.cursorRev();
                         }
-                    } else if (marker.hasTileLabel("math")) {
-                        return;
                     }
                 } else if ((marker.refType === MergeTree.ReferenceType.NestEnd) && (marker.hasRangeLabel("cell"))) {
                     const cellMarker = marker as Table.ICellMarker;
@@ -3601,12 +3487,6 @@ export class FlowView extends ui.Component implements SearchMenu.ISearchMenuHost
                     } else {
                         this.cursorRev();
                     }
-                } else if (isMathComponentView(marker)) {
-                    const mathMarker = marker as IMathViewMarker;
-                    this.loadMath(mathMarker);
-                    this.cursor.disable();
-                    this.childCursor = mathMarker.instance;
-                    mathMarker.instance.enter(CursorDirection.Right);
                 } else {
                     this.cursorRev();
                 }
@@ -3629,8 +3509,6 @@ export class FlowView extends ui.Component implements SearchMenu.ISearchMenuHost
                         } else {
                             return;
                         }
-                    } else if (marker.hasTileLabel("math")) {
-                        this.cursor.pos++;
                     }
                 } else if (marker.refType & MergeTree.ReferenceType.NestBegin) {
                     if (marker.hasRangeLabel("table")) {
@@ -3654,12 +3532,6 @@ export class FlowView extends ui.Component implements SearchMenu.ISearchMenuHost
                     } else {
                         this.cursorFwd();
                     }
-                } else if (isMathComponentView(marker)) {
-                    const mathMarker = marker as IMathViewMarker;
-                    this.loadMath(mathMarker);
-                    this.cursor.disable();
-                    this.childCursor = mathMarker.instance;
-                    mathMarker.instance.enter(CursorDirection.Left);
                 } else {
                     this.cursorFwd();
                 }
@@ -3970,32 +3842,27 @@ export class FlowView extends ui.Component implements SearchMenu.ISearchMenuHost
                 } else if (e.keyCode === KeyCode.esc) {
                     this.clearSelection();
                 } else if (e.keyCode === KeyCode.backspace) {
-                    // TODO: in math region; don't backspace if region empty
-                    if (this.getMathViewMarker()) {
-                        this.mathComponentViewKeydown(e);
+                    let toRemove = this.cursor.getSelection();
+                    if (toRemove) {
+                        // If there was a selected range, use it as range to remove below.  In preparation, clear
+                        // the FlowView's selection and set the cursor to the start of the range to be deleted.
+                        this.clearSelection();
+                        this.cursor.pos = toRemove.start;
                     } else {
-                        let toRemove = this.cursor.getSelection();
-                        if (toRemove) {
-                            // If there was a selected range, use it as range to remove below.  In preparation, clear
-                            // the FlowView's selection and set the cursor to the start of the range to be deleted.
-                            this.clearSelection();
-                            this.cursor.pos = toRemove.start;
-                        } else {
-                            // Otherwise, construct the range to remove by moving the cursor once in the reverse
-                            // direction. Below we will remove the positions spanned by the current and previous cursor
-                            // positions.
-                            const removeEnd = this.cursor.pos;
-                            this.cursorRev();
-                            toRemove = {
-                                end: removeEnd,
-                                start: this.cursor.pos,
-                            };
-                        }
-                        if (this.modes.showCursorLocation) {
-                            this.cursorLocation();
-                        }
-                        this.sharedString.removeText(toRemove.start, toRemove.end);
+                        // Otherwise, construct the range to remove by moving the cursor once in the reverse
+                        // direction. Below we will remove the positions spanned by the current and previous cursor
+                        // positions.
+                        const removeEnd = this.cursor.pos;
+                        this.cursorRev();
+                        toRemove = {
+                            end: removeEnd,
+                            start: this.cursor.pos,
+                        };
                     }
+                    if (this.modes.showCursorLocation) {
+                        this.cursorLocation();
+                    }
+                    this.sharedString.removeText(toRemove.start, toRemove.end);
                 } else if (((e.keyCode === KeyCode.pageUp) || (e.keyCode === KeyCode.pageDown)) && (!this.ticking)) {
                     setTimeout(() => {
                         this.scroll(e.keyCode === KeyCode.pageUp);
@@ -4020,42 +3887,32 @@ export class FlowView extends ui.Component implements SearchMenu.ISearchMenuHost
                 } else if (e.keyCode === KeyCode.rightArrow) {
                     this.undoRedoManager.closeCurrentOperation();
                     if (this.cursor.pos < (this.sharedString.getLength() - 1)) {
-                        if (this.getMathViewMarker()) {
-                            const marker = getContainingSegment(this, this.cursor.pos).segment as IMathViewMarker;
-                            this.mathComponentViewCursorFwd(marker);
-                        } else {
-                            if (this.cursor.pos === this.viewportEndPos) {
-                                this.scroll(false, true);
-                            }
-                            if (e.shiftKey) {
-                                this.cursor.tryMark();
-                            } else {
-                                this.clearSelection();
-                            }
-                            this.cursorFwd();
-                            this.broadcastPresence();
-                            this.cursor.updateView(this);
+                        if (this.cursor.pos === this.viewportEndPos) {
+                            this.scroll(false, true);
                         }
+                        if (e.shiftKey) {
+                            this.cursor.tryMark();
+                        } else {
+                            this.clearSelection();
+                        }
+                        this.cursorFwd();
+                        this.broadcastPresence();
+                        this.cursor.updateView(this);
                     }
                 } else if (e.keyCode === KeyCode.leftArrow) {
                     this.undoRedoManager.closeCurrentOperation();
                     if (this.cursor.pos > FlowView.docStartPosition) {
-                        if (this.getMathViewMarker()) {
-                            const marker = getContainingSegment(this, this.cursor.pos).segment as IMathViewMarker;
-                            this.mathComponentViewCursorRev(marker);
-                        } else {
-                            if (this.cursor.pos === this.viewportStartPos) {
-                                this.scroll(true, true);
-                            }
-                            if (e.shiftKey) {
-                                this.cursor.tryMark();
-                            } else {
-                                this.clearSelection();
-                            }
-                            this.cursorRev();
-                            this.broadcastPresence();
-                            this.cursor.updateView(this);
+                        if (this.cursor.pos === this.viewportStartPos) {
+                            this.scroll(true, true);
                         }
+                        if (e.shiftKey) {
+                            this.cursor.tryMark();
+                        } else {
+                            this.clearSelection();
+                        }
+                        this.cursorRev();
+                        this.broadcastPresence();
+                        this.cursor.updateView(this);
                     }
                 } else if ((e.keyCode === KeyCode.upArrow) || (e.keyCode === KeyCode.downArrow)) {
                     this.undoRedoManager.closeCurrentOperation();
@@ -4124,14 +3981,11 @@ export class FlowView extends ui.Component implements SearchMenu.ISearchMenuHost
                     // TODO: other labels; for now assume only list/pg tile labels
                     this.insertParagraph(this.cursor.pos++);
                 } else {
-                    if (this.getMathViewMarker()) {
-                        this.mathComponentViewKeypress(e);
-                    } else {
-                        this.sharedString.insertText(pos, String.fromCharCode(code));
-                        if (code === CharacterCodes.space) {
-                            this.undoRedoManager.closeCurrentOperation();
-                        }
+                    this.sharedString.insertText(pos, String.fromCharCode(code));
+                    if (code === CharacterCodes.space) {
+                        this.undoRedoManager.closeCurrentOperation();
                     }
+
                     this.clearSelection();
                     if (this.modes.showCursorLocation) {
                         this.cursorLocation();
@@ -4145,58 +3999,6 @@ export class FlowView extends ui.Component implements SearchMenu.ISearchMenuHost
         this.on("keypress", keypressHandler);
         this.keypressHandler = keypressHandler;
         this.keydownHandler = keydownHandler;
-    }
-
-    // Add caching
-    public getMathViewMarker() {
-        const segment = getContainingSegment(this, this.cursor.pos).segment;
-        if (MergeTree.Marker.is(segment)) {
-            if (isMathComponentView(segment)) {
-                return segment as IMathViewMarker;
-            }
-        }
-    }
-
-    public mathComponentViewKeypress(e: KeyboardEvent) {
-        const marker = this.getMathViewMarker();
-        if (!marker.instance) {
-            this.loadMath(marker);
-        }
-        marker.instance.onKeypress(e);
-    }
-
-    public mathComponentViewKeydown(e: KeyboardEvent) {
-        const marker = this.getMathViewMarker();
-        if (!marker.instance) {
-            this.loadMath(marker);
-        }
-        marker.instance.onKeydown(e);
-    }
-
-    public mathComponentViewCursorFwd(marker: IMathViewMarker) {
-        if (!marker.instance) {
-            this.loadMath(marker);
-        }
-        if (marker.instance.fwd()) {
-            marker.instance.leave(CursorDirection.Right);
-            this.cursor.enable();
-            this.cursorFwd();
-        }
-        this.broadcastPresence();
-        this.cursor.updateView(this);
-    }
-
-    public mathComponentViewCursorRev(marker: IMathViewMarker) {
-        if (!marker.instance) {
-            this.loadMath(marker);
-        }
-        if (marker.instance.rev()) {
-            marker.instance.leave(CursorDirection.Left);
-            this.cursorRev();
-            this.cursor.enable();
-        }
-        this.broadcastPresence();
-        this.cursor.updateView(this);
     }
 
     public viewTileProps() {
@@ -4433,7 +4235,7 @@ export class FlowView extends ui.Component implements SearchMenu.ISearchMenuHost
     }
 
     public showCommentText() {
-        const overlappingComments = this.commentsView.findOverlappingIntervals(
+        const overlappingComments = this.comments.findOverlappingIntervals(
             this.cursor.pos,
             this.cursor.pos + 1);
 
@@ -4458,7 +4260,7 @@ export class FlowView extends ui.Component implements SearchMenu.ISearchMenuHost
     public createComment() {
         const sel = this.cursor.getSelection();
         if (sel) {
-            const commentStory = this.collabDocument.createString();
+            const commentStory = Sequence.SharedString.create(this.runtime);
             commentStory.insertText(0, "a comment...");
             this.comments.add(
                 sel.start,
@@ -4471,74 +4273,9 @@ export class FlowView extends ui.Component implements SearchMenu.ISearchMenuHost
     }
 
     public async insertComponentNew(prefix: string, chaincode: string, inline = false) {
-        const router = await this.collabDocument.context.containerRuntime.createDataStore(chaincode);
+        const router = await this.context.containerRuntime.createDataStore(chaincode);
         const object = await requestFluidObject(router, "");
         const loadable = object.IFluidLoadable;
-
-        const props = {
-            crefTest: {
-                layout: { inline },
-                type: {
-                    name: "component",
-                } as IReferenceDocType,
-                url: loadable.handle,
-            },
-            leafId: loadable.handle,
-        };
-
-        if (!inline) {
-            this.insertParagraph(this.cursor.pos++);
-        }
-
-        const markerPos = this.cursor.pos;
-        this.sharedString.insertMarker(markerPos, MergeTree.ReferenceType.Simple, props);
-    }
-
-    public loadMath(mathMarker: IMathViewMarker) {
-        if (!mathMarker.instance) {
-            const inline = mathMarker.properties.crefTest.layout.inline;
-            const mathOptions: IMathOptions = { display: inline ? "inline" : "block" };
-            const mathInstance = this.math.getInstance(mathMarker.properties.leafId, mathOptions);
-            mathMarker.instance = mathInstance;
-            if (mathInstance.ISearchMenuClient) {
-                mathInstance.registerSearchMenuHost(this);
-            }
-        }
-    }
-
-    public insertMath(inline = true) {
-        const mathOptions: IMathOptions = { display: inline ? "inline" : "block" };
-        const mathInstance = this.math.createCollectionItem(mathOptions);
-        const props = {
-            crefTest: {
-                layout: { inline },
-                type: {
-                    name: "math",
-                } as IReferenceDocType,
-                url: mathInstance.id,
-            },
-            // Change this to just use url and IFluidRouter on collection
-            leafId: mathInstance.leafId,
-        };
-        if (!inline) {
-            this.insertParagraph(this.cursor.pos++);
-        }
-        const markerPos = this.cursor.pos;
-        this.sharedString.insertMarker(markerPos, MergeTree.ReferenceType.Simple, props);
-        const mathMarker = getContainingSegment(this, markerPos).segment as IMathViewMarker;
-        mathMarker.instance = mathInstance;
-        if (mathInstance.ISearchMenuClient) {
-            mathInstance.registerSearchMenuHost(this);
-        }
-        this.cursor.disable();
-        this.childCursor = mathMarker.instance;
-        mathMarker.instance.enter(CursorDirection.Left);
-    }
-
-    public insertNewCollectionComponent(collection: IFluidObjectCollection, inline = false) {
-        // TODO - we may want to have a shared component collection?
-        const instance = collection.createCollectionItem();
-        const loadable = instance.IFluidLoadable;
 
         const props = {
             crefTest: {
@@ -4573,20 +4310,6 @@ export class FlowView extends ui.Component implements SearchMenu.ISearchMenuHost
             [Paragraph.referenceProperty]: irdoc,
         };
         this.sharedString.insertMarker(this.cursor.pos++, MergeTree.ReferenceType.Simple, refProps);
-    }
-
-    private async openCollections() {
-        const root = this.collabDocument.getRoot();
-
-        const [progressBars, math, images] = await Promise.all([
-            root.get<IFluidHandle>("progressBars").get(),
-            root.get<IFluidHandle<IMathCollection>>("math").get(),
-            root.get<IFluidHandle>("images").get(),
-        ]);
-
-        this.math = math;
-        this.progressBars = progressBars.IFluidObjectCollection;
-        this.images = images.IFluidObjectCollection;
     }
 
     public copy() {
@@ -4659,7 +4382,7 @@ export class FlowView extends ui.Component implements SearchMenu.ISearchMenuHost
                 const tableMarkerPos = getPosition(this, tableMarker);
                 Table.parseTable(tableMarker, tableMarkerPos, this.sharedString, makeFontInfo(this.lastDocContext));
             }
-            Table.deleteColumn(this.sharedString, this.collabDocument.clientId,
+            Table.deleteColumn(this.sharedString, this.runtime.clientId,
                 cellMarker.cell, rowMarker.row, tableMarker.table);
         }
     }
@@ -4673,7 +4396,12 @@ export class FlowView extends ui.Component implements SearchMenu.ISearchMenuHost
                 const tableMarkerPos = getPosition(this, tableMarker);
                 Table.parseTable(tableMarker, tableMarkerPos, this.sharedString, makeFontInfo(this.lastDocContext));
             }
-            Table.insertRow(this.sharedString, this.collabDocument.clientId, rowMarker.row, tableMarker.table);
+            Table.insertRow(
+                this.sharedString,
+                this.runtime.clientId,
+                rowMarker.row,
+                tableMarker.table,
+            );
         }
     }
 
@@ -4792,7 +4520,7 @@ export class FlowView extends ui.Component implements SearchMenu.ISearchMenuHost
             }
             Table.insertColumn(
                 this.sharedString,
-                this.collabDocument.clientId,
+                this.runtime.clientId,
                 cellMarker.cell,
                 rowMarker.row,
                 tableMarker.table);
@@ -4831,7 +4559,7 @@ export class FlowView extends ui.Component implements SearchMenu.ISearchMenuHost
                 break;
             case CharacterCodes.R: {
                 this.updatePGInfo(this.cursor.pos - 1);
-                Table.createTable(this.cursor.pos, this.sharedString, this.collabDocument.clientId);
+                Table.createTable(this.cursor.pos, this.sharedString, this.runtime.clientId);
                 break;
             }
             case CharacterCodes.M: {
@@ -5004,25 +4732,20 @@ export class FlowView extends ui.Component implements SearchMenu.ISearchMenuHost
     public async loadFinished(clockStart = 0) {
         // Work around a race condition with multiple shared strings trying to create the interval
         // collections at the same time
-        if (this.collabDocument.existing) {
-            await Promise.all([
-                this.sharedString.waitIntervalCollection("bookmarks"),
-                this.sharedString.waitIntervalCollection("comments"),
-            ]);
-        }
+        await Promise.all([
+            this.sharedString.waitIntervalCollection("bookmarks"),
+            this.sharedString.waitIntervalCollection("comments"),
+        ]);
 
-        const bookmarksCollection = this.sharedString.getIntervalCollection("bookmarks");
-        this.bookmarks = await bookmarksCollection.getView();
+        this.bookmarks = this.sharedString.getIntervalCollection("bookmarks");
 
-        // For examples of showing the API we do interval adds on the collection with comments. But use
-        // the view when doing bookmarks.
+        // For examples of showing the API we do interval adds on the collection with comments.
         this.comments = this.sharedString.getIntervalCollection("comments");
-        this.commentsView = await this.comments.getView();
 
         this.sequenceTest = await this.docRoot
             .get<IFluidHandle<Sequence.SharedNumberSequence>>("sequence-test")
             .get();
-        this.sequenceTest.on("op", (op) => {
+        this.sequenceTest.on("sequenceDelta", (ev: Sequence.SequenceDeltaEvent) => {
             this.showSequenceEntries();
         });
         this.render(0, true);
@@ -5030,7 +4753,7 @@ export class FlowView extends ui.Component implements SearchMenu.ISearchMenuHost
             // eslint-disable-next-line max-len
             console.log(`time to edit/impression: ${this.timeToEdit} time to load: ${Date.now() - clockStart}ms len: ${this.sharedString.getLength()} - ${performance.now()}`);
         }
-        this.presenceSignal = new PresenceSignal(this.collabDocument.runtime);
+        this.presenceSignal = new PresenceSignal(this.runtime);
         this.addPresenceSignal(this.presenceSignal);
 
         this.sharedString.on("valueChanged", (delta: types.IValueChanged) => {
@@ -5180,7 +4903,7 @@ export class FlowView extends ui.Component implements SearchMenu.ISearchMenuHost
                     presenceColor: this.presenceVector.has(clientId) ?
                         this.presenceVector.get(clientId).presenceColor :
                         presenceColors[this.presenceVector.size % presenceColors.length],
-                    shouldShowCursor: () => this.collabDocument.clientId !== clientId &&
+                    shouldShowCursor: () => this.runtime.clientId !== clientId &&
                         this.getRemoteClientInfo(clientId) !== undefined,
                     user: clientInfo.user,
                 } as ILocalPresenceInfo;
@@ -5198,11 +4921,11 @@ export class FlowView extends ui.Component implements SearchMenu.ISearchMenuHost
     }
 
     private getRemoteClientInfo(clientId: string): IClient {
-        const quorumClient = this.collabDocument.getClient(clientId);
+        const quorumClient = this.runtime.getQuorum().getMember(clientId);
         if (quorumClient) {
             return quorumClient.client;
         } else {
-            const audience = this.collabDocument.runtime.getAudience().getMembers();
+            const audience = this.runtime.getAudience().getMembers();
             if (audience.has(clientId)) {
                 return audience.get(clientId);
             }
@@ -5210,7 +4933,7 @@ export class FlowView extends ui.Component implements SearchMenu.ISearchMenuHost
     }
 
     private broadcastPresence() {
-        if (this.presenceSignal && this.collabDocument.isConnected) {
+        if (this.presenceSignal && this.runtime.connected) {
             const presenceInfo: IRemotePresenceInfo = {
                 origMark: this.cursor.mark,
                 origPos: this.cursor.pos,
@@ -5222,7 +4945,7 @@ export class FlowView extends ui.Component implements SearchMenu.ISearchMenuHost
     }
 
     private broadcastDragPresence() {
-        if (this.presenceSignal && this.collabDocument.isConnected) {
+        if (this.presenceSignal && this.runtime.connected) {
             const dragPresenceInfo: IRemoteDragInfo = {
                 dx: this.movingInclusion.dx,
                 dy: this.movingInclusion.dy,

@@ -91,31 +91,35 @@ export class LoaderContainerTracker implements IOpProcessingController {
             for (const msg of messages) {
                 if (msg.type === MessageType.NoOp) {
                     // Track the NoOp that was sent.
-                    if (record.startTrailingNoOps === 0) {
+                    if (record.trailingNoOps === 0) {
+                        // record the starting sequence number of the trailing no ops if we haven't been tracking yet.
                         record.startTrailingNoOps = msg.clientSequenceNumber;
                     }
                     record.trailingNoOps++;
                 } else {
                     // Other ops has been sent. We would like to see those ack'ed, so no more need to track NoOps
-                    record.startTrailingNoOps = 0;
                     record.trailingNoOps = 0;
                 }
             }
         });
 
         container.deltaManager.inbound.on("push", (message) => {
-            // Received the no op back, update the record.
+            // Received the no op back, update the record if we are tracking
             if (message.type === MessageType.NoOp
                 && message.clientId === (container as Container).clientId
-                && message.clientSequenceNumber === record.startTrailingNoOps) {
-                record.trailingNoOps--;
-                record.startTrailingNoOps++;
+                && record.trailingNoOps !== 0
+                && record.startTrailingNoOps <= message.clientSequenceNumber
+            ) {
+                // NoOp might have coalesced and skipped ahead some sequence number
+                // update the record and skip ahead as well
+                const oldStartTrailingNoOps = record.startTrailingNoOps;
+                record.startTrailingNoOps = message.clientSequenceNumber + 1;
+                record.trailingNoOps -= (record.startTrailingNoOps - oldStartTrailingNoOps);
             }
         });
 
         container.on("disconnected", () => {
             // reset on disconnect.
-            record.startTrailingNoOps = 0;
             record.trailingNoOps = 0;
         });
     }
@@ -340,6 +344,7 @@ export class LoaderContainerTracker implements IOpProcessingController {
         for (const container of containersToApply) {
             const record = this.containers.get(container);
             if (record !== undefined && record.paused) {
+                debugWait(`${record.index}: container resumed`);
                 container.deltaManager.inbound.resume();
                 container.deltaManager.outbound.resume();
                 resumed.push(container);
@@ -359,6 +364,7 @@ export class LoaderContainerTracker implements IOpProcessingController {
         for (const container of containersToApply) {
             const record = this.containers.get(container);
             if (record !== undefined && !record.paused) {
+                debugWait(`${record.index}: container paused`);
                 pauseP.push(container.deltaManager.inbound.pause());
                 pauseP.push(container.deltaManager.outbound.pause());
                 record.paused = true;
@@ -463,45 +469,57 @@ export class LoaderContainerTracker implements IOpProcessingController {
     private setupTrace(container: IContainer, index: number) {
         if (debugOp.enabled) {
             const getContentsString = (type: string, msgContents: any) => {
-                if (type !== MessageType.Operation) {
-                    if (typeof msgContents === "string") { return msgContents; }
-                    return JSON.stringify(msgContents);
-                }
-                let address = "";
-                let contents = JSON.parse(msgContents);
-                // eslint-disable-next-line no-null/no-null
-                while (contents !== undefined && contents !== null) {
-                    if (contents.contents?.address !== undefined) {
-                        address += `/${contents.contents.address}`;
-                        contents = contents.contents.contents;
-                    } else if (contents.content?.address !== undefined) {
-                        address += `/${contents.content.address}`;
-                        contents = contents.content.contents;
-                    } else {
-                        break;
+                try {
+                    if (type !== MessageType.Operation) {
+                        if (typeof msgContents === "string") { return msgContents; }
+                        return JSON.stringify(msgContents);
                     }
+                    let address = "";
+
+                    // contents comes in the wire as JSON string ("push" event)
+                    // But already parsed when apply ("op" event)
+                    let contents = typeof msgContents === "string" ?
+                        JSON.parse(msgContents) : msgContents;
+                    // eslint-disable-next-line no-null/no-null
+                    while (contents !== undefined && contents !== null) {
+                        if (contents.contents?.address !== undefined) {
+                            address += `/${contents.contents.address}`;
+                            contents = contents.contents.contents;
+                        } else if (contents.content?.address !== undefined) {
+                            address += `/${contents.content.address}`;
+                            contents = contents.content.contents;
+                        } else {
+                            break;
+                        }
+                    }
+                    if (address) {
+                        return `${address} ${JSON.stringify(contents)}`;
+                    }
+                    return JSON.stringify(contents);
+                } catch (e) {
+                    return `${e.message}: ${e.stack}`;
                 }
-                if (address) {
-                    return `${address} ${JSON.stringify(contents)}`;
-                }
-                return JSON.stringify(contents);
             };
             debugOp(`${index}: ADD: clientId: ${(container as Container).clientId}`);
             container.deltaManager.outbound.on("op", (messages) => {
                 for (const msg of messages) {
                     debugOp(`${index}: OUT:          `
                         + `cli: ${msg.clientSequenceNumber.toString().padStart(3)} `
-                        + `         ${msg.type} ${getContentsString(msg.type, msg.contents)}`);
+                        + `rsq: ${msg.referenceSequenceNumber.toString().padStart(3)} `
+                        + `${msg.type} ${getContentsString(msg.type, msg.contents)}`);
                 }
             });
-            container.deltaManager.inbound.on("push", (msg) => {
-                const clientSeq = msg.clientId === (container as Container).clientId ?
-                    `cli: ${msg.clientSequenceNumber.toString().padStart(3)}` : "        ";
-                debugOp(`${index}: IN : seq: ${msg.sequenceNumber.toString().padStart(3)} `
-                    + `${clientSeq} min: ${msg.minimumSequenceNumber.toString().padStart(3)} `
-                    + `${msg.type} ${getContentsString(msg.type, msg.contents)}`);
-            });
-
+            const getInboundHandler = (type: string) => {
+                return (msg: ISequencedDocumentMessage) => {
+                    const clientSeq = msg.clientId === (container as Container).clientId ?
+                        `cli: ${msg.clientSequenceNumber.toString().padStart(3)}` : "        ";
+                    debugOp(`${index}: ${type}: seq: ${msg.sequenceNumber.toString().padStart(3)} `
+                        + `${clientSeq} min: ${msg.minimumSequenceNumber.toString().padStart(3)} `
+                        + `${msg.type} ${getContentsString(msg.type, msg.contents)}`);
+                };
+            };
+            container.deltaManager.inbound.on("push", getInboundHandler("IN "));
+            container.deltaManager.inbound.on("op", getInboundHandler("OP "));
             container.deltaManager.on("connect", (details) => {
                 debugOp(`${index}: CON: clientId: ${details.clientId}`);
             });

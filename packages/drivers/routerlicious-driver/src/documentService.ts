@@ -5,7 +5,8 @@
 
 import { assert } from "@fluidframework/common-utils";
 import * as api from "@fluidframework/driver-definitions";
-import { IClient} from "@fluidframework/protocol-definitions";
+import { RateLimiter } from "@fluidframework/driver-utils";
+import { IClient, ISnapshotTree} from "@fluidframework/protocol-definitions";
 import { GitManager, Historian } from "@fluidframework/server-services-client";
 import io from "socket.io-client";
 import { ITelemetryLogger } from "@fluidframework/common-definitions";
@@ -14,8 +15,9 @@ import { DocumentStorageService } from "./documentStorageService";
 import { R11sDocumentDeltaConnection } from "./documentDeltaConnection";
 import { NullBlobStorageService } from "./nullBlobStorageService";
 import { ITokenProvider } from "./tokens";
-import { RouterliciousStorageRestWrapper } from "./restWrapper";
+import { RouterliciousOrdererRestWrapper, RouterliciousStorageRestWrapper } from "./restWrapper";
 import { IRouterliciousDriverPolicies } from "./policies";
+import { ICache } from "./cache";
 
 /**
  * The DocumentService manages the Socket.IO connection and manages routing requests to connected
@@ -32,6 +34,8 @@ export class DocumentService implements api.IDocumentService {
         protected tenantId: string,
         protected documentId: string,
         private readonly driverPolicies: IRouterliciousDriverPolicies,
+        private readonly blobCache: ICache<ArrayBufferLike>,
+        private readonly snapshotTreeCache: ICache<ISnapshotTree>,
     ) {
     }
 
@@ -49,11 +53,14 @@ export class DocumentService implements api.IDocumentService {
             return new NullBlobStorageService();
         }
 
+        const rateLimiter = new RateLimiter(this.driverPolicies.maxConcurrentStorageRequests);
         const storageRestWrapper = await RouterliciousStorageRestWrapper.load(
             this.tenantId,
             this.documentId,
             this.tokenProvider,
             this.logger,
+            rateLimiter,
+            this.driverPolicies.enableRestLess,
             this.gitUrl,
         );
         const historian = new Historian(
@@ -66,13 +73,17 @@ export class DocumentService implements api.IDocumentService {
             caching: this.driverPolicies.enablePrefetch
                 ? api.LoaderCachingPolicy.Prefetch
                 : api.LoaderCachingPolicy.NoCaching,
+            minBlobSize: this.driverPolicies.aggregateBlobsSmallerThanBytes,
         };
 
         this.documentStorageService = new DocumentStorageService(
             this.documentId,
             gitManager,
             this.logger,
-            documentStorageServicePolicies);
+            documentStorageServicePolicies,
+            this.driverPolicies,
+            this.blobCache,
+            this.snapshotTreeCache);
         return this.documentStorageService;
     }
 
@@ -84,7 +95,16 @@ export class DocumentService implements api.IDocumentService {
     public async connectToDeltaStorage(): Promise<api.IDocumentDeltaStorageService> {
         assert(!!this.documentStorageService, 0x0b1 /* "Storage service not initialized" */);
 
-        const deltaStorage = new DeltaStorageService(this.deltaStorageUrl, this.tokenProvider, this.logger);
+        const rateLimiter = new RateLimiter(this.driverPolicies.maxConcurrentOrdererRequests);
+        const ordererRestWrapper = await RouterliciousOrdererRestWrapper.load(
+            this.tenantId,
+            this.documentId,
+            this.tokenProvider,
+            this.logger,
+            rateLimiter,
+            this.driverPolicies.enableRestLess,
+        );
+        const deltaStorage = new DeltaStorageService(this.deltaStorageUrl, ordererRestWrapper, this.logger);
         return new DocumentDeltaStorageService(this.tenantId, this.documentId,
             deltaStorage, this.documentStorageService);
     }

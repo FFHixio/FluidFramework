@@ -15,7 +15,7 @@ import {
     IDocumentServicePolicies,
 } from "@fluidframework/driver-definitions";
 import { DeltaStreamConnectionForbiddenError } from "@fluidframework/driver-utils";
-import { fetchTokenErrorCode, throwOdspNetworkError } from "@fluidframework/odsp-doclib-utils";
+import { fetchTokenErrorCode, IFacetCodes, throwOdspNetworkError } from "@fluidframework/odsp-doclib-utils";
 import {
     IClient,
     ISequencedDocumentMessage,
@@ -25,6 +25,7 @@ import {
     TokenFetchOptions,
     IEntry,
     HostStoragePolicy,
+    InstrumentedStorageTokenFetcher,
 } from "@fluidframework/odsp-driver-definitions";
 import { HostStoragePolicyInternal, ISocketStorageDiscovery } from "./contracts";
 import { IOdspCache } from "./odspCache";
@@ -36,6 +37,20 @@ import { fetchJoinSession } from "./vroom";
 import { isOdcOrigin } from "./odspUrlHelper";
 import { EpochTracker } from "./epochTracker";
 import { OpsCache } from "./opsCaching";
+import { RetryErrorsStorageAdapter } from "./retryErrorsStorageAdapter";
+
+// Gate that when set to "1", instructs to fetch the binary format snapshot from the spo.
+function gatesBinaryFormatSnapshot() {
+    try {
+        if (typeof localStorage === "object" && localStorage !== null) {
+            if  (localStorage.binaryFormatSnapshot === "1") {
+                return true;
+            }
+        }
+    } catch (e) {}
+    return false;
+}
+
 /**
  * The DocumentService manages the Socket.IO connection and manages routing requests to connected
  * clients
@@ -55,16 +70,18 @@ export class OdspDocumentService implements IDocumentService {
      * @param cache - This caches response for joinSession.
      * @param hostPolicy - This host constructed policy which customizes service behavior.
      * @param epochTracker - This helper class which adds epoch to backend calls made by returned service instance.
+     * @param socketReferenceKeyPrefix - (optional) prefix to isolate socket reuse cache
      */
     public static async create(
         resolvedUrl: IResolvedUrl,
-        getStorageToken: (options: TokenFetchOptions, name: string) => Promise<string | null>,
+        getStorageToken: InstrumentedStorageTokenFetcher,
         getWebsocketToken: ((options: TokenFetchOptions) => Promise<string | null>) | undefined,
         logger: ITelemetryLogger,
         socketIoClientFactory: () => Promise<SocketIOClientStatic>,
         cache: IOdspCache,
         hostPolicy: HostStoragePolicy,
         epochTracker: EpochTracker,
+        socketReferenceKeyPrefix?: string,
     ): Promise<IDocumentService> {
         return new OdspDocumentService(
             getOdspResolvedUrl(resolvedUrl),
@@ -75,6 +92,7 @@ export class OdspDocumentService implements IDocumentService {
             cache,
             hostPolicy,
             epochTracker,
+            socketReferenceKeyPrefix,
         );
     }
 
@@ -88,6 +106,8 @@ export class OdspDocumentService implements IDocumentService {
 
     private _opsCache?: OpsCache;
 
+    private currentConnection?: OdspDocumentDeltaConnection;
+
     /**
      * @param odspResolvedUrl - resolved url identifying document that will be managed by this service instance.
      * @param getStorageToken - function that can provide the storage token. This is is also referred to as
@@ -98,18 +118,20 @@ export class OdspDocumentService implements IDocumentService {
      * @param logger - a logger that can capture performance and diagnostic information
      * @param socketIoClientFactory - A factory that returns a promise to the socket io library required by the driver
      * @param cache - This caches response for joinSession.
-     * @param hostPolicy - This host constructed policy which customizes service behavior.
+     * @param hostPolicy - host constructed policy which customizes service behavior.
      * @param epochTracker - This helper class which adds epoch to backend calls made by this service instance.
+     * @param socketReferenceKeyPrefix - (optional) prefix to isolate socket reuse cache
      */
-    constructor(
+    private constructor(
         public readonly odspResolvedUrl: IOdspResolvedUrl,
-        private readonly getStorageToken: (options: TokenFetchOptions, name: string) => Promise<string | null>,
+        private readonly getStorageToken: InstrumentedStorageTokenFetcher,
         private readonly getWebsocketToken: ((options: TokenFetchOptions) => Promise<string | null>) | undefined,
         logger: ITelemetryLogger,
         private readonly socketIoClientFactory: () => Promise<SocketIOClientStatic>,
         private readonly cache: IOdspCache,
         hostPolicy: HostStoragePolicy,
         private readonly epochTracker: EpochTracker,
+        private readonly socketReferenceKeyPrefix?: string,
     ) {
         this._policies = {
             // load in storage-only mode if a file version is specified
@@ -126,6 +148,7 @@ export class OdspDocumentService implements IDocumentService {
             });
 
         this.hostPolicy = hostPolicy;
+        this.hostPolicy.fetchBinarySnapshotFormat ??= gatesBinaryFormatSnapshot();
         if (this.odspResolvedUrl.summarizer) {
             this.hostPolicy = { ...this.hostPolicy, summarizerClient: true };
         }
@@ -153,10 +176,17 @@ export class OdspDocumentService implements IDocumentService {
                 this.cache,
                 this.hostPolicy,
                 this.epochTracker,
+                // flushCallback
+                async () => {
+                    if (this.currentConnection !== undefined && !this.currentConnection.disposed) {
+                        return this.currentConnection.flush();
+                    }
+                    throw new Error("Disconnected while uploading summary (attempt to perform flush())");
+                },
             );
         }
 
-        return this.storageManager;
+        return new RetryErrorsStorageAdapter(this.storageManager, this.logger);
     }
 
     /**
@@ -176,9 +206,8 @@ export class OdspDocumentService implements IDocumentService {
         // batch size, please see issue #5211 for data around batch sizing
         const batchSize = this.hostPolicy.opsBatchSize ?? 5000;
         const concurrency = this.hostPolicy.concurrentOpsBatches ?? 1;
-
         return new OdspDeltaStorageWithCache(
-            snapshotOps.map((op) => op.op),
+            snapshotOps,
             this.logger,
             batchSize,
             concurrency,
@@ -186,6 +215,11 @@ export class OdspDocumentService implements IDocumentService {
             async (from, to) => {
                 const res = await this.opsCache?.get(from, to);
                 return res as ISequencedDocumentMessage[] ?? [];
+            },
+            (from, to) => {
+                if (this.currentConnection !== undefined && !this.currentConnection.disposed) {
+                    this.currentConnection.requestOps(from, to);
+                }
             },
             (ops: ISequencedDocumentMessage[]) => this.opsReceived(ops),
         );
@@ -197,33 +231,35 @@ export class OdspDocumentService implements IDocumentService {
      * @returns returns the document delta stream service for onedrive/sharepoint driver.
      */
     public async connectToDeltaStream(client: IClient): Promise<IDocumentDeltaConnection> {
+        // Presence of getWebsocketToken callback dictates whether callback is used for fetching
+        // websocket token or whether it is returned with joinSession response payload
+        const requestWebsocketTokenFromJoinSession = this.getWebsocketToken === undefined;
+        const joinSessionPromise = this.joinSession(requestWebsocketTokenFromJoinSession).catch((e) => {
+            const likelyFacetCodes = e as IFacetCodes;
+            if (Array.isArray(likelyFacetCodes.facetCodes)) {
+                for (const code of likelyFacetCodes.facetCodes) {
+                    switch (code) {
+                        case "sessionForbiddenOnPreservedFiles":
+                        case "sessionForbiddenOnModerationEnabledLibrary":
+                        case "sessionForbiddenOnRequireCheckout":
+                            // This document can only be opened in storage-only mode.
+                            // DeltaManager will recognize this error
+                            // and load without a delta stream connection.
+                            this._policies = {...this._policies,storageOnly: true};
+                            throw new DeltaStreamConnectionForbiddenError(code);
+                        default:
+                            continue;
+                    }
+                }
+            }
+            throw e;
+        });
         // Attempt to connect twice, in case we used expired token.
         return getWithRetryForTokenRefresh<IDocumentDeltaConnection>(async (options) => {
-            // Presence of getWebsocketToken callback dictates whether callback is used for fetching
-            // websocket token or whether it is returned with joinSession response payload
-            const requestWebsocketTokenFromJoinSession = this.getWebsocketToken === undefined;
             const websocketTokenPromise = requestWebsocketTokenFromJoinSession
                 ? Promise.resolve(null)
                 : this.getWebsocketToken!(options);
-            const joinSessionPromise = this.joinSession(requestWebsocketTokenFromJoinSession).catch((e) => {
-                let code: string | undefined;
-                try {
-                    code = e?.response ? JSON.parse(e?.response)?.error?.code : undefined;
-                } catch (error) {
-                    throw e;
-                }
-                switch (code) {
-                    case "sessionForbiddenOnPreservedFiles":
-                    case "sessionForbiddenOnModerationEnabledLibrary":
-                    case "sessionForbiddenOnRequireCheckout":
-                        // This document can only be opened in storage-only mode. DeltaManager will recognize this error
-                        // and load without a delta stream connection.
-                        this._policies = {...this._policies,storageOnly: true};
-                        throw new DeltaStreamConnectionForbiddenError(code);
-                    default:
-                        throw e;
-                }
-            });
+
             const [websocketEndpoint, websocketToken, io] =
                 await Promise.all([
                     joinSessionPromise,
@@ -233,7 +269,7 @@ export class OdspDocumentService implements IDocumentService {
 
             const finalWebsocketToken = websocketToken ?? (websocketEndpoint.socketToken || null);
             if (finalWebsocketToken === null) {
-                throwOdspNetworkError("Push Token is null", fetchTokenErrorCode);
+                throwOdspNetworkError("pushTokenIsNull", fetchTokenErrorCode);
             }
             try {
                 const connection = await this.connectToDeltaStreamWithRetry(
@@ -246,6 +282,7 @@ export class OdspDocumentService implements IDocumentService {
                 connection.on("op", (documentId, ops: ISequencedDocumentMessage[]) => {
                     this.opsReceived(ops);
                 });
+                this.currentConnection = connection;
                 return connection;
             } catch (error) {
                 this.cache.sessionJoinCache.remove(this.joinSessionKey);
@@ -293,7 +330,7 @@ export class OdspDocumentService implements IDocumentService {
         io: SocketIOClientStatic,
         client: IClient,
         webSocketUrl: string,
-    ): Promise<IDocumentDeltaConnection> {
+    ): Promise<OdspDocumentDeltaConnection> {
         const startTime = performance.now();
         const connection = await OdspDocumentDeltaConnection.create(
             tenantId,
@@ -305,6 +342,7 @@ export class OdspDocumentService implements IDocumentService {
             this.logger,
             60000,
             this.epochTracker,
+            this.socketReferenceKeyPrefix,
         );
         const duration = performance.now() - startTime;
         // This event happens rather often, so it adds up to cost of telemetry.
@@ -322,7 +360,7 @@ export class OdspDocumentService implements IDocumentService {
     public dispose(error?: any) {
         // Error might indicate mismatch between client & server knowlege about file
         // (DriverErrorType.fileOverwrittenInStorage).
-        // For exaple, file might have been overwritten in storage without generating new epoch
+        // For example, file might have been overwritten in storage without generating new epoch
         // In such case client cached info is stale and has to be removed.
         if (error !== undefined) {
             this.epochTracker.removeEntries().catch(() => {});
@@ -354,10 +392,10 @@ export class OdspDocumentService implements IDocumentService {
                 write: async (key: string, opsData: string) => {
                     return this.cache.persistedCache.put({...opsKey, key}, opsData);
                 },
-                read: async (batch: string) => undefined,
+                read: async (key: string) => this.cache.persistedCache.get({...opsKey, key}),
                 remove: () => { this.cache.persistedCache.removeEntries().catch(() => {}); },
             },
-            this.hostPolicy.opsCaching?.batchSize ?? 100,
+            batchSize,
             this.hostPolicy.opsCaching?.timerGranularity ?? 5000,
             this.hostPolicy.opsCaching?.totalOpsToCache ?? 5000,
         );

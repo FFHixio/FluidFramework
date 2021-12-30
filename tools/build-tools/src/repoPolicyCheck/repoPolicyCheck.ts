@@ -15,7 +15,7 @@ import { handlers as copyrightFileHeaderHandlers } from "./handlers/copyrightFil
 import { handlers as npmPackageContentsHandlers } from "./handlers/npmPackages";
 import { handler as dockerfilePackageHandler } from "./handlers/dockerfilePackages";
 import { handler as fluidCaseHandler } from "./handlers/fluidCase";
-import { handler as lockfilesHandler } from "./handlers/lockfiles";
+import { handlers as lockfilesHandlers } from "./handlers/lockfiles";
 
 const exclusions: RegExp[] = require('../../data/exclusions.json').map((e: string) => new RegExp(e, "i"));
 
@@ -23,7 +23,7 @@ const exclusions: RegExp[] = require('../../data/exclusions.json').map((e: strin
  * argument parsing
  */
 program
-    .option('-q|--quiet', 'Quiet mode')
+    .option('-v|--verbose', 'Verbose mode')
     .option('-r|--resolve', 'Resolve errors if possible')
     .option('-h|--handler <regex>', 'Filter handler names by <regex>')
     .option('-p|--path <regex>', 'Filter file paths by <regex>')
@@ -34,7 +34,7 @@ const handlerRegex = (program.handler ? new RegExp(program.handler, 'i') : /.?/)
 const pathRegex = (program.path ? new RegExp(program.path, 'i') : /.?/);
 
 function writeOutLine(output: string) {
-    if (!program.quiet) {
+    if (program.verbose) {
         console.log(output);
     }
 }
@@ -59,7 +59,7 @@ const handlers: Handler[] = [
     ...npmPackageContentsHandlers,
     dockerfilePackageHandler,
     fluidCaseHandler,
-    lockfilesHandler,
+    ...lockfilesHandlers,
     assertShortCodeHandler,
 ];
 
@@ -153,7 +153,7 @@ lineReader.once("close",()=>{
 
 
 process.on("beforeExit", () => {
-    writeOutLine(`Statitisics: ${processed} processed, ${count - processed} excluded, ${count} total`);
+    writeOutLine(`Statistics: ${processed} processed, ${count - processed} excluded, ${count} total`);
     handlerActionPerf.forEach((handlerPerf, action)=>{
         writeOutLine(`Performance for "${action}":`);
         handlerPerf.forEach((dur, handler)=>{

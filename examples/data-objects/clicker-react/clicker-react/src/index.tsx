@@ -3,6 +3,7 @@
  * Licensed under the MIT License.
  */
 
+import { ContainerViewRuntimeFactory } from "@fluid-example/example-utils";
 import {
     DataObjectFactory,
 } from "@fluidframework/aqueduct";
@@ -12,10 +13,9 @@ import {
     IFluidState,
     IViewState,
     SyncedDataObject,
-} from "@fluidframework/react";
+} from "@fluid-experimental/react";
 import { SharedCounter } from "@fluidframework/counter";
 import * as React from "react";
-import * as ReactDOM from "react-dom";
 
 /**
  * Basic Clicker example using FluidReactView
@@ -44,19 +44,6 @@ export class Clicker extends SyncedDataObject {
                 defaultViewState: {},
             },
         );
-    }
-    /**
-     * Will return a new Clicker view
-     */
-    public render(element: HTMLElement) {
-        ReactDOM.render(
-            <CounterReactView
-                syncedStateId={"clicker"}
-                syncedDataObject={this}
-            />,
-            element,
-        );
-        return element;
     }
 }
 
@@ -95,4 +82,12 @@ export const ClickerInstantiationFactory =
         [SharedCounter.getFactory()],
         {},
     );
-export const fluidExport = ClickerInstantiationFactory;
+
+const clickerViewCallback = (clicker: Clicker) =>
+    <CounterReactView
+        syncedStateId={ "clicker" }
+        syncedDataObject={ clicker }
+    />;
+
+export const fluidExport =
+    new ContainerViewRuntimeFactory<Clicker>(ClickerInstantiationFactory, clickerViewCallback);

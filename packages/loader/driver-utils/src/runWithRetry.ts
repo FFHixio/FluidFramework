@@ -14,7 +14,7 @@ export async function runWithRetry<T>(
     refreshDelayInfo: (id: string) => void,
     emitDelayInfo: (id: string, retryInMs: number, err: any) => void,
     logger: ITelemetryLogger,
-    shouldRetry?: () => { retry: boolean, error: any | undefined},
+    checkRetry?: () => void,
 ): Promise<T> {
     let result: T | undefined;
     let success = false;
@@ -31,19 +31,13 @@ export async function runWithRetry<T>(
             }
             success = true;
         } catch (err) {
-            if (shouldRetry !== undefined) {
-                const res = shouldRetry();
-                if (res.retry === false) {
-                    if (res.error !== undefined) {
-                        throw res.error;
-                    }
-                    throw err;
-                }
+            if (checkRetry !== undefined) {
+                checkRetry();
             }
             // If it is not retriable, then just throw the error.
             if (!canRetryOnError(err)) {
                 logger.sendErrorEvent({
-                    eventName: fetchCallName,
+                    eventName: `${fetchCallName}_cancel`,
                     retry: numRetries,
                     duration: performance.now() - startTime,
                 }, err);
@@ -63,7 +57,7 @@ export async function runWithRetry<T>(
     } while (!success);
     if (numRetries > 0) {
         logger.sendTelemetryEvent({
-            eventName: fetchCallName,
+            eventName: `${fetchCallName}_lastError`,
             retry: numRetries,
             duration: performance.now() - startTime,
         },
