@@ -1,7 +1,11 @@
 # Copyright (c) Microsoft Corporation and contributors. All rights reserved.
 # Licensed under the MIT License.
 
+main
 FROM node:12.22.1-slim AS base
+
+FROM node:12.22.5-slim AS base
+ain
 
 # node-gyp dependencies
 RUN apt-get update && apt-get install -y \
