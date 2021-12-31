@@ -1,11 +1,15 @@
 # Copyright (c) Microsoft Corporation and contributors. All rights reserved.
 # Licensed under the MIT License.
 
+snyk-fix-6417de75eff3dc15a1ee882cd4647d35
+FROM node:12.22.2-slim AS base
+
 main
 FROM node:12.22.1-slim AS base
 
 FROM node:12.22.5-slim AS base
 ain
+ main
 
 # node-gyp dependencies
 RUN apt-get update && apt-get install -y \
