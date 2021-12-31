@@ -49,7 +49,9 @@ data:
         "zookeeper": {
             "endpoint": "{{ .Values.zookeeper.url }}"
         },
-        {{- end }}
+        "storage": {
+            "enableWholeSummaryUpload": {{ .Values.storage.enableWholeSummaryUpload }}
+        },
         "alfred": {
             "kafkaClientId": "{{ template "alfred.fullname" . }}",
             "maxMessageSize": "16KB",
@@ -87,7 +89,8 @@ data:
             "socketIoAdapter" : {
                 "enableCustomSocketIoAdapter": {{ .Values.alfred.socketIoAdapter.enableCustomSocketIoAdapter }},
                 "shouldDisableDefaultNamespace": {{ .Values.alfred.socketIoAdapter.shouldDisableDefaultNamespace }}
-            }
+            },
+            "enforceServerGeneratedDocumentId": {{ .Values.alfred.enforceServerGeneratedDocumentId }}
         },
         "client": {
             "type": "browser",

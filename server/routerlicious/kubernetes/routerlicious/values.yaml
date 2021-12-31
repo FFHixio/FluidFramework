@@ -35,7 +35,9 @@ alfred:
   socketIoAdapter:
     enableCustomSocketIoAdapter: true
     shouldDisableDefaultNamespace: false
-
+  enforceServerGeneratedDocumentId: false
+storage:
+  enableWholeSummaryUpload: false
 deli:
   name: deli
   replicas: 8

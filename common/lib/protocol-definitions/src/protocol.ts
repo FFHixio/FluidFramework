@@ -163,6 +163,12 @@ export interface ISequencedDocumentMessage {
 
     // Timestamp when the server ticketed the message
     timestamp: number;
+
+    /**
+     * Experimental field for storing the rolling hash at sequence number.
+     * @alpha
+     */
+    expHash1?: string;
 }
 
 export interface ISequencedDocumentSystemMessage extends ISequencedDocumentMessage {
@@ -244,11 +250,37 @@ export interface ISummaryAck {
 /**
  * Contents of summary nack expected from the server.
  */
-export interface ISummaryNack extends IServerError {
+export interface ISummaryNack {
     /**
      * Information about the proposed summary op.
      */
     summaryProposal: ISummaryProposal;
+
+    /**
+     * Message describing the error.
+     * @deprecated - Use "message" instead. Clients should check for message ?? errorMessage.
+     * Once all servers & clients are all updated, we can remove that errorMessage property
+     */
+    errorMessage: string;
+
+    /**
+     * An error code number that represents the error. It will be a valid HTTP error code.
+     * 403 errors are non retryable.
+     * 400 errors are always immediately retriable.
+     * 429 errors are retriable or non retriable (depends on type field).
+     */
+    code?: number;
+
+    /**
+     * A message about the error for debugging/logging/telemetry purposes
+     */
+    message?: string;
+
+    /**
+     * Optional Retry-After time in seconds.
+     * If specified, the client should wait this many seconds before retrying.8
+     */
+    retryAfter?: number;
 }
 
 /**

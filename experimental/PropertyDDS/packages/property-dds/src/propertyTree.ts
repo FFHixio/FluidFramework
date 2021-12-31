@@ -3,6 +3,12 @@
  * Licensed under the MIT License.
  */
 
+/* eslint-disable import/no-internal-modules */
+import isEmpty from "lodash/isEmpty";
+import cloneDeep from "lodash/cloneDeep";
+import findIndex from "lodash/findIndex";
+import range from "lodash/range";
+
 import {
 	ISequencedDocumentMessage,
 	ITree,
@@ -22,16 +28,24 @@ import { bufferToString, assert } from "@fluidframework/common-utils";
 import { SharedObject } from "@fluidframework/shared-object-base";
 import { IFluidSerializer } from "@fluidframework/core-interfaces";
 
-import { ChangeSet, Utils as ChangeSetUtils } from "@fluid-experimental/property-changeset";
+import {
+	ChangeSet,
+	Utils as ChangeSetUtils,
+    rebaseToRemoteChanges,
+} from "@fluid-experimental/property-changeset";
 
 import { PropertyFactory, BaseProperty, NodeProperty } from "@fluid-experimental/property-properties";
 
 import { v4 as uuidv4 } from "uuid";
-import _ from "lodash";
 import axios from "axios";
 import { PropertyTreeFactory } from "./propertyTreeFactory";
 
 export type SerializedChangeSet = any;
+
+export type Metadata = any;
+
+type FetchUnrebasedChangeFn = (guid: string) => IRemotePropertyTreeMessage;
+type FetchRebasedChangesFn = (startGuid: string, endGuid?: string) => IPropertyTreeMessage[];
 
 export const enum OpKind {
 	// eslint-disable-next-line @typescript-eslint/no-shadow
@@ -41,6 +55,7 @@ export const enum OpKind {
 export interface IPropertyTreeMessage {
 	op: OpKind;
 	changeSet: SerializedChangeSet;
+	metadata: Metadata;
 	guid: string;
 	referenceGuid: string;
 	remoteHeadGuid: string;
@@ -83,7 +98,6 @@ export interface SharedPropertyTreeOptions {
  * in the total order)
  */
 export class SharedPropertyTree extends SharedObject {
-	// Initial state of the PRNG.  Must not be zero.  (See `advance()` below for details.)
 	tipView: SerializedChangeSet = {};
 	remoteTipView: SerializedChangeSet = {};
 	localChanges: IPropertyTreeMessage[] = [];
@@ -151,29 +165,45 @@ export class SharedPropertyTree extends SharedObject {
 	public _reportDirtinessToView() {
 		const changes = this._root._serialize(true, false, BaseProperty.MODIFIED_STATE_FLAGS.DIRTY);
 		const _changeSet = new ChangeSet(changes);
-		if (!_.isEmpty(_changeSet.getSerializedChangeSet())) {
+		if (!isEmpty(_changeSet.getSerializedChangeSet())) {
 			this.emit("localModification", _changeSet);
 		}
 		this._root.cleanDirty(BaseProperty.MODIFIED_STATE_FLAGS.DIRTY);
 	}
 
-	public get changeSet() {
+	public get changeSet(): SerializedChangeSet {
 		// eslint-disable-next-line @typescript-eslint/no-unsafe-return
 		return this.tipView;
+	}
+
+    public get activeCommit(): IPropertyTreeMessage {
+        if(this.localChanges.length > 0) {
+            return this.localChanges[this.localChanges.length - 1];
+        } else {
+            return this.remoteChanges[this.remoteChanges.length - 1];
+        }
 	}
 	public get root(): NodeProperty {
 		return this._root as NodeProperty;
 	}
 
-	public commit(submitEmptyChange = false) {
+	public commit(metadata?: Metadata, submitEmptyChange?: boolean) {
 		const changes = this._root._serialize(true, false, BaseProperty.MODIFIED_STATE_FLAGS.PENDING_CHANGE);
-        if (submitEmptyChange || !_.isEmpty(changes)) {
-            this.applyChangeSet(changes);
+
+        let doSubmit = !!submitEmptyChange;
+
+        // if no override provided dont submit unless metadata are provided
+        if (submitEmptyChange === undefined) {
+            doSubmit =  metadata !== undefined;
+        }
+
+        if (doSubmit || !isEmpty(changes)) {
+            this.applyChangeSet(changes, metadata || {});
             this.root.cleanDirty();
         }
 	}
 
-	private applyChangeSet(changeSet: SerializedChangeSet) {
+	private applyChangeSet(changeSet: SerializedChangeSet, metadata: Metadata) {
 		const _changeSet = new ChangeSet(changeSet);
 		_changeSet._toReversibleChangeSet(this.tipView);
 
@@ -184,6 +214,7 @@ export class SharedPropertyTree extends SharedObject {
 		const change = {
 			op: OpKind.ChangeSet,
 			changeSet,
+			metadata,
 			guid: uuidv4(),
 			remoteHeadGuid,
 			referenceGuid:
@@ -195,7 +226,7 @@ export class SharedPropertyTree extends SharedObject {
 
 		// Queue the op for transmission to the Fluid service.
 		if (this.transmissionsHaveBeenStopped) {
-			this.enqueuedMessages.push(_.cloneDeep(change));
+			this.enqueuedMessages.push(cloneDeep(change));
 		} else {
 			this.submitLocalMessage(change);
 		}
@@ -251,7 +282,7 @@ export class SharedPropertyTree extends SharedObject {
 				case OpKind.ChangeSet:
 					// If the op originated locally from this client, we've already accounted for it
 					// by advancing the state.  Otherwise, advance the PRNG now.
-					this._applyRemoteChangeSet(_.cloneDeep(content));
+					this._applyRemoteChangeSet(cloneDeep(content));
 					break;
 				default:
 					break;
@@ -264,7 +295,7 @@ export class SharedPropertyTree extends SharedObject {
 		remoteChanges: IPropertyTreeMessage[],
 		unrebasedRemoteChanges: Record<string, IRemotePropertyTreeMessage>,
 	) {
-		// for faster lookup of remote chage guids
+		// for faster lookup of remote change guids
 		const remoteChangeMap = new Map<string, number>();
 		remoteChanges.forEach((change, index) => {
 			remoteChangeMap.set(change.guid, index);
@@ -309,6 +340,12 @@ export class SharedPropertyTree extends SharedObject {
 				if (visitor.remoteHeadGuid === visitor.referenceGuid && remoteChangeMap.has(visitor.referenceGuid)) {
 					visitedRemoteChanges.add(visitor.referenceGuid);
 				}
+
+                // If we have a change that refers to the start of the history (remoteHeadGuid === ""), we have to
+                // keep all remote Changes until this change has been processed
+                if (visitor.remoteHeadGuid === "") {
+                    visitedRemoteChanges.add(remoteChanges[0].guid);
+                }
 			}
 		}
 		let pruned = 0;
@@ -365,7 +402,7 @@ export class SharedPropertyTree extends SharedObject {
 				remoteChanges: this.remoteChanges,
 				unrebasedRemoteChanges: this.unrebasedRemoteChanges,
 			};
-			const chunkSize = 64 * 1024; // Default limit seems to be 100k
+			const chunkSize = 5000 * 1024; // Default limit seems to be 5MB
 			let serializedSummary =
 				serializer !== undefined ? serializer.stringify(summary, this.handle) : JSON.stringify(summary);
 
@@ -427,13 +464,13 @@ export class SharedPropertyTree extends SharedObject {
 		try {
 			if (!snapshot.useMH) {
 				// We load all chunks
-				const chunks = await Promise.all(
-					_.range(snapshot.numChunks).map(async (i) => {
+				const chunks: string[] = await Promise.all(
+					range(snapshot.numChunks).map(async (i) => {
 						return bufferToString(await storage.readBlob(`summaryChunk_${i}`), "utf8");
 					}),
 				);
 
-				const serializedSummary = _.reduce(chunks, (a, b) => a + b, "");
+				const serializedSummary = chunks.reduce((a, b) => a + b, "");
 				const snapshotSummary: ISnapshotSummary =
 					serializer !== undefined ? serializer.parse(serializedSummary) : JSON.parse(serializedSummary);
 				if (
@@ -455,7 +492,7 @@ export class SharedPropertyTree extends SharedObject {
 						this.options.paths,
 					);
 				}
-				this.tipView = _.cloneDeep(this.remoteTipView);
+				this.tipView = cloneDeep(this.remoteTipView);
 
 				this.skipSequenceNumber = 0;
 			} else {
@@ -478,7 +515,7 @@ export class SharedPropertyTree extends SharedObject {
 				}
 
 				this.tipView = materializedView;
-				this.remoteTipView = _.cloneDeep(this.tipView);
+				this.remoteTipView = cloneDeep(this.tipView);
 				this.remoteChanges = [];
 
 				let missingDeltas: ISequencedDocumentMessage[] = [];
@@ -493,7 +530,8 @@ export class SharedPropertyTree extends SharedObject {
 				// eslint-disable-next-line @typescript-eslint/prefer-for-of
 				for (let i = 0; i < missingDeltas.length; i++) {
 					if (missingDeltas[i].sequenceNumber < commitMetadata.sequenceNumber) {
-						const remoteChange = JSON.parse(missingDeltas[i].contents).contents.contents.content.contents;
+						const remoteChange: IPropertyTreeMessage
+							= JSON.parse(missingDeltas[i].contents).contents.contents.content.contents;
 						const { changeSet } = (
 							await axios.get(
 								`http://localhost:3000/branch/${branchGuid}/commit/${remoteChange.guid}/changeSet`,
@@ -527,8 +565,8 @@ export class SharedPropertyTree extends SharedObject {
 		}
 	}
 
-	protected registerCore() {}
-	protected onDisconnect() {}
+	protected registerCore() { }
+	protected onDisconnect() { }
 
 	private _applyLocalChangeSet(change: IPropertyTreeMessage) {
 		const changeSetWrapper = new ChangeSet(this.tipView);
@@ -538,8 +576,16 @@ export class SharedPropertyTree extends SharedObject {
 	}
 
 	private _applyRemoteChangeSet(change: IRemotePropertyTreeMessage) {
-		// Rebase the commit with respect to the remote changes
-		this.rebaseToRemoteChanges(change);
+		this.unrebasedRemoteChanges[change.guid] = cloneDeep(change);
+
+		// This is the first message in the history of the document.
+		if (this.remoteChanges.length !== 0) {
+			rebaseToRemoteChanges(
+				change,
+				this.getUnrebasedChange.bind(this),
+				this.getRebasedChanges.bind(this),
+			);
+		}
 
 		this.remoteChanges.push(change);
 
@@ -566,151 +612,18 @@ export class SharedPropertyTree extends SharedObject {
 		// This is disabled for performance reasons. Only used during debugging
 		// assert(JSON.stringify(this.root.serialize()) === JSON.stringify(this.tipView));
 	}
-	private rebaseToRemoteChanges(change: IRemotePropertyTreeMessage) {
-		this.unrebasedRemoteChanges[change.guid] = _.cloneDeep(change);
 
-		// This is the first message in the history of the document.
-		if (this.remoteChanges.length === 0) {
-			return;
-		}
-
-		const commitsOnOtherLocalBranch: Record<string, IPropertyTreeMessage> = {};
-		let rebaseBaseChangeSet = new ChangeSet({});
-		const changesOnOtherLocalBranch: IPropertyTreeMessage[] = [];
-		if (change.referenceGuid !== change.remoteHeadGuid) {
-			// Extract all changes inbetween the remoteHeadGuid and the referenceGuid
-			let currentGuid = change.referenceGuid;
-			for (;;) {
-				const currentChange = this.unrebasedRemoteChanges[currentGuid];
-				if (currentChange === undefined) {
-					throw new Error("Received change that references a non-existing parent change");
-				}
-				changesOnOtherLocalBranch.unshift(currentChange);
-				commitsOnOtherLocalBranch[currentGuid] = currentChange;
-				if (currentGuid === change.localBranchStart) {
-					break;
-				}
-				currentGuid = currentChange.referenceGuid;
-			}
-
-			// Now we extract all changes until we arrive at a change that is relative to a remote change
-			const alreadyRebasedChanges: IPropertyTreeMessage[] = [];
-			let currentRebasedChange = this.unrebasedRemoteChanges[change.localBranchStart];
-			while (currentRebasedChange.remoteHeadGuid !== currentRebasedChange.referenceGuid) {
-				currentGuid = currentRebasedChange.referenceGuid;
-				currentRebasedChange = this.unrebasedRemoteChanges[currentGuid];
-				alreadyRebasedChanges.unshift(currentRebasedChange);
-				if (currentRebasedChange === undefined) {
-					throw new Error("Received change that references a non-existing parent change");
-				}
-			}
-
-			// Compute the base Changeset to rebase the changes on the branch that was still the local branch
-			// when the incoming change was created
-
-			// First invert all changes on the previous local branch
-			let startIndex: number;
-			if (alreadyRebasedChanges.length > 0) {
-				startIndex = _.findIndex(this.remoteChanges, (c) => c.guid === alreadyRebasedChanges[0].referenceGuid);
-			} else {
-				startIndex = _.findIndex(
-					this.remoteChanges,
-					(c) => c.guid === changesOnOtherLocalBranch[0].referenceGuid,
-				);
-			}
-
-			// Then apply all changes on the local remote branch
-			const endIndex = _.findIndex(this.remoteChanges, (c) => c.guid === change.remoteHeadGuid);
-			const relevantRemoteChanges = this.remoteChanges.slice(startIndex + 1, endIndex + 1);
-			let rebaseBaseChangeSetForAlreadyRebasedChanges = new ChangeSet({});
-
-			for (const c of relevantRemoteChanges) {
-				let changeset = c.changeSet;
-				let applyAfterMetaInformation: Map<any, any> | undefined;
-
-				if (alreadyRebasedChanges[0]?.guid === c.guid) {
-					const invertedChange = new ChangeSet(_.cloneDeep(alreadyRebasedChanges[0].changeSet));
-					invertedChange._toInverseChangeSet();
-					invertedChange.applyChangeSet(rebaseBaseChangeSetForAlreadyRebasedChanges);
-					applyAfterMetaInformation = new Map();
-					const conflicts2 = [];
-					changeset = _.cloneDeep(alreadyRebasedChanges[0].changeSet);
-					rebaseBaseChangeSetForAlreadyRebasedChanges._rebaseChangeSet(changeset, conflicts2, {
-						applyAfterMetaInformation,
-					});
-
-					rebaseBaseChangeSetForAlreadyRebasedChanges = invertedChange;
-					alreadyRebasedChanges.shift();
-				}
-				rebaseBaseChangeSetForAlreadyRebasedChanges.applyChangeSet(changeset, { applyAfterMetaInformation });
-			}
-
-			// Now we have to rebase all changes from the remote local branch with respect to this base changeset
-			this.rebaseChangeArrays(rebaseBaseChangeSetForAlreadyRebasedChanges, changesOnOtherLocalBranch);
-
-			// Update the reference for the rebased changes to indicate that they are now with respect to the
-			// new remoteHeadGuid
-			if (changesOnOtherLocalBranch.length > 0) {
-				changesOnOtherLocalBranch[0].remoteHeadGuid = change.remoteHeadGuid;
-				changesOnOtherLocalBranch[0].referenceGuid = change.remoteHeadGuid;
-			}
-		}
-
-		const baseCommitID = _.findIndex(this.remoteChanges, (c) => c.guid === change.remoteHeadGuid);
-
-		const conflicts = [] as any[];
-		for (let i = baseCommitID + 1; i < this.remoteChanges.length; i++) {
-			let applyAfterMetaInformation =
-				commitsOnOtherLocalBranch[this.remoteChanges[i].guid] !== undefined
-					? this.remoteChanges[i].rebaseMetaInformation
-					: undefined;
-
-			let changeset = this.remoteChanges[i].changeSet;
-			if (changesOnOtherLocalBranch[0]?.guid === this.remoteChanges[i].guid) {
-				const invertedChange = new ChangeSet(_.cloneDeep(changesOnOtherLocalBranch[0].changeSet));
-				invertedChange._toInverseChangeSet();
-				invertedChange.applyChangeSet(rebaseBaseChangeSet);
-
-				applyAfterMetaInformation = new Map();
-				changeset = _.cloneDeep(changesOnOtherLocalBranch[0].changeSet);
-				rebaseBaseChangeSet._rebaseChangeSet(changeset, conflicts, { applyAfterMetaInformation });
-
-				// This is disabled for performance reasons. Only used during debugging
-				// assert(_.isEqual(changeset,this.remoteChanges[i].changeSet),
-				//                 "Failed Rebase in rebaseToRemoteChanges");
-				rebaseBaseChangeSet = invertedChange;
-				changesOnOtherLocalBranch.shift();
-			}
-
-			rebaseBaseChangeSet.applyChangeSet(changeset, {
-				applyAfterMetaInformation,
-			});
-		}
-
-		change.rebaseMetaInformation = new Map();
-		rebaseBaseChangeSet._rebaseChangeSet(change.changeSet, conflicts, {
-			applyAfterMetaInformation: change.rebaseMetaInformation,
-		});
+	getUnrebasedChange(guid: string) {
+		return this.unrebasedRemoteChanges[guid];
 	}
 
-	private rebaseChangeArrays(baseChangeSet: ChangeSet, changesToRebase: IPropertyTreeMessage[]) {
-		let rebaseBaseChangeSet = baseChangeSet;
-		for (const change of changesToRebase) {
-			const copiedChangeSet = new ChangeSet(_.cloneDeep(change.changeSet));
-			copiedChangeSet._toInverseChangeSet();
-
-			const conflicts = [] as any[];
-			change.rebaseMetaInformation = new Map();
-			rebaseBaseChangeSet._rebaseChangeSet(change.changeSet, conflicts, {
-				applyAfterMetaInformation: change.rebaseMetaInformation,
-			});
-
-			copiedChangeSet.applyChangeSet(rebaseBaseChangeSet);
-			copiedChangeSet.applyChangeSet(change.changeSet, {
-				applyAfterMetaInformation: change.rebaseMetaInformation,
-			});
-			rebaseBaseChangeSet = copiedChangeSet;
+	getRebasedChanges(startGuid: string, endGuid?: string) {
+		const startIndex = findIndex(this.remoteChanges, (c) => c.guid === startGuid);
+        if (endGuid !== undefined) {
+            const endIndex = findIndex(this.remoteChanges, (c) => c.guid === endGuid);
+			return this.remoteChanges.slice(startIndex + 1, endIndex + 1);
 		}
+		return this.remoteChanges.slice(startIndex + 1);
 	}
 
 	private rebaseLocalChanges(
@@ -718,7 +631,7 @@ export class SharedPropertyTree extends SharedObject {
 		pendingChanges: SerializedChangeSet,
 		newTipDelta: SerializedChangeSet,
 	): boolean {
-		let rebaseBaseChangeSet = _.cloneDeep(change.changeSet);
+		let rebaseBaseChangeSet = cloneDeep(change.changeSet);
 
 		const accumulatedChanges: SerializedChangeSet = {};
 		const conflicts = [] as any[];
@@ -743,12 +656,12 @@ export class SharedPropertyTree extends SharedObject {
 
 			const rebaseMetaInformation = new Map();
 
-			const copiedChangeSet = new ChangeSet(_.cloneDeep(this.localChanges[i].changeSet));
+			const copiedChangeSet = new ChangeSet(cloneDeep(this.localChanges[i].changeSet));
 			new ChangeSet(rebaseBaseChangeSet)._rebaseChangeSet(this.localChanges[i].changeSet, conflicts, {
 				applyAfterMetaInformation: rebaseMetaInformation,
 			});
 
-			copiedChangeSet._toInverseChangeSet();
+			copiedChangeSet.toInverseChangeSet();
 			copiedChangeSet.applyChangeSet(rebaseBaseChangeSet);
 			copiedChangeSet.applyChangeSet(this.localChanges[i].changeSet, {
 				applyAfterMetaInformation: rebaseMetaInformation,
@@ -762,7 +675,7 @@ export class SharedPropertyTree extends SharedObject {
 		const pendingChangesRebaseMetaInformation = new Map();
 		const deltaToTipCS = new ChangeSet(newTipDelta);
 		deltaToTipCS.applyChangeSet(pendingChanges);
-		deltaToTipCS._toInverseChangeSet();
+		deltaToTipCS.toInverseChangeSet();
 
 		// Perform a rebase of the pending changes
 		new ChangeSet(rebaseBaseChangeSet)._rebaseChangeSet(pendingChanges, conflicts, {
@@ -776,15 +689,19 @@ export class SharedPropertyTree extends SharedObject {
 			applyAfterMetaInformation: pendingChangesRebaseMetaInformation,
 		});
 
-		// Udate the the tip view
-		this.tipView = _.cloneDeep(this.remoteTipView);
-		const changeSet = new ChangeSet(this.tipView);
-		changeSet.applyChangeSet(accumulatedChanges);
+		// Update the tip view
+		if (!this.tipView) {
+            this.tipView = cloneDeep(this.remoteTipView);
+            const changeSet = new ChangeSet(this.tipView);
+            changeSet.applyChangeSet(accumulatedChanges);
+        } else {
+            new ChangeSet(this.tipView).applyChangeSet(newTipDelta);
+        }
 
 		return true;
 	}
 
-    protected applyStashedOp() {
-        throw new Error("not implemented");
-    }
+	protected applyStashedOp() {
+		throw new Error("not implemented");
+	}
 }

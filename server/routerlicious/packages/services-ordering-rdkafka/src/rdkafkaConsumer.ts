@@ -9,9 +9,6 @@ import { Deferred } from "@fluidframework/common-utils";
 import { IConsumer, IPartition, IPartitionWithEpoch, IQueuedMessage } from "@fluidframework/server-services-core";
 import { ZookeeperClient } from "@fluidframework/server-services-ordering-zookeeper";
 import { IKafkaBaseOptions, IKafkaEndpoints, RdkafkaBase } from "./rdkafkaBase";
-import { tryImportNodeRdkafka } from "./tryImport";
-
-const kafka = tryImportNodeRdkafka();
 
 export interface IKafkaConsumerOptions extends Partial<IKafkaBaseOptions> {
 	consumeTimeout: number;
@@ -63,6 +60,13 @@ export class RdkafkaConsumer extends RdkafkaBase implements IConsumer {
 		return this.consumer?.isConnected() ? true : false;
 	}
 
+	/**
+	 * Returns the offset of the latest consumsed message
+	 */
+	public getLatestMessageOffset(partitionId: number): number | undefined {
+		return this.latestOffsets.get(partitionId);
+	}
+
 	protected connect() {
 		if (this.closed) {
 			return;
@@ -86,10 +90,11 @@ export class RdkafkaConsumer extends RdkafkaBase implements IConsumer {
 			"offset_commit_cb": true,
 			"rebalance_cb": this.consumerOptions.optimizedRebalance ? this.rebalance.bind(this) : true,
 			...this.consumerOptions.additionalOptions,
+			...this.sslOptions,
 		};
 
 		const consumer: kafkaTypes.KafkaConsumer = this.consumer =
-			new kafka.KafkaConsumer(options, { "auto.offset.reset": "latest" });
+			new this.kafka.KafkaConsumer(options, { "auto.offset.reset": "latest" });
 
 		consumer.setDefaultConsumeTimeout(this.consumerOptions.consumeTimeout);
 		consumer.setDefaultConsumeLoopTimeoutDelay(this.consumerOptions.consumeLoopTimeoutDelay);
@@ -109,6 +114,7 @@ export class RdkafkaConsumer extends RdkafkaBase implements IConsumer {
 			this.emit("disconnected");
 		});
 
+		// eslint-disable-next-line @typescript-eslint/no-misused-promises
 		consumer.on("connection.failure", async (error) => {
 			await this.close(true);
 
@@ -127,8 +133,8 @@ export class RdkafkaConsumer extends RdkafkaBase implements IConsumer {
 				// we can resubmit the commit if we still own the partition
 				shouldRetryCommit =
 					this.consumerOptions.optimizedRebalance &&
-					(err.code === kafka.CODES.ERRORS.ERR_REBALANCE_IN_PROGRESS ||
-						err.code === kafka.CODES.ERRORS.ERR_ILLEGAL_GENERATION);
+					(err.code === this.kafka.CODES.ERRORS.ERR_REBALANCE_IN_PROGRESS ||
+						err.code === this.kafka.CODES.ERRORS.ERR_ILLEGAL_GENERATION);
 
 				if (!shouldRetryCommit) {
 					this.error(err);
@@ -163,9 +169,10 @@ export class RdkafkaConsumer extends RdkafkaBase implements IConsumer {
 			}
 		});
 
+		// eslint-disable-next-line @typescript-eslint/no-misused-promises
 		consumer.on("rebalance", async (err, topicPartitions) => {
-			if (err.code === kafka.CODES.ERRORS.ERR__ASSIGN_PARTITIONS ||
-				err.code === kafka.CODES.ERRORS.ERR__REVOKE_PARTITIONS) {
+			if (err.code === this.kafka.CODES.ERRORS.ERR__ASSIGN_PARTITIONS ||
+				err.code === this.kafka.CODES.ERRORS.ERR__REVOKE_PARTITIONS) {
 				const newAssignedPartitions = new Set<number>(topicPartitions.map((tp) => tp.partition));
 
 				if (newAssignedPartitions.size === this.assignedPartitions.size &&
@@ -388,7 +395,7 @@ export class RdkafkaConsumer extends RdkafkaBase implements IConsumer {
 		}
 
 		try {
-			if (err.code === kafka.CODES.ERRORS.ERR__ASSIGN_PARTITIONS) {
+			if (err.code === this.kafka.CODES.ERRORS.ERR__ASSIGN_PARTITIONS) {
 				for (const assignment of assignments) {
 					const offset = this.latestOffsets.get(assignment.partition);
 					if (offset !== undefined) {
@@ -400,7 +407,7 @@ export class RdkafkaConsumer extends RdkafkaBase implements IConsumer {
 				}
 
 				this.consumer.assign(assignments);
-			} else if (err.code === kafka.CODES.ERRORS.ERR__REVOKE_PARTITIONS) {
+			} else if (err.code === this.kafka.CODES.ERRORS.ERR__REVOKE_PARTITIONS) {
 				this.consumer.unassign();
 			}
 		} catch (ex) {

@@ -88,10 +88,12 @@ export const create404Response = (request: IRequest) => createResponseError(404,
 
 export function createResponseError(status: number, value: string, request: IRequest): IResponse {
     assert(status !== 200, 0x19b /* "Cannot not create response error on 200 status" */);
+    // Omit query string which could contain personal data (aka "PII")
+    const urlNoQuery = request.url?.split("?")[0];
     return {
         mimeType: "text/plain",
         status,
-        value: request.url === undefined ? value : `${value}: ${request.url}`,
+        value: urlNoQuery === undefined ? value : `${value}: ${urlNoQuery}`,
         stack: getStack(),
     };
 }
@@ -108,7 +110,7 @@ export function createDataStoreFactory(
         type,
         get IFluidDataStoreFactory() { return this; },
         get IFluidDataStoreRegistry() { return this; },
-        instantiateDataStore: async (context) => (await factory).instantiateDataStore(context),
+        instantiateDataStore: async (context, existing) => (await factory).instantiateDataStore(context, existing),
         get: async (name: string) => (await factory).IFluidDataStoreRegistry?.get(name),
     };
 }

@@ -82,7 +82,7 @@
     "@fluidframework/server-services-utils": "^0.1014.0",
     "@fluidframework/view-adapters": "^0.28.0",
     "@fluidframework/web-code-loader": "^0.28.0",
-    "axios": "^0.21.1",
+    "axios": "^0.21.2",
     "body-parser": "^1.17.1",
     "comlink": "^4.3.0",
     "compression": "^1.7.2",
@@ -117,10 +117,10 @@
     "split": "^1.0.0",
     "static-expiry": "0.0.11",
     "uuid": "^8.3.1",
-    "winston": "^3.1.0"
+    "winston": "^3.3.3"
   },
   "devDependencies": {
-    "@fluidframework/build-common": "^0.22.0-0",
+    "@fluidframework/build-common": "^0.23.0",
     "@fluidframework/eslint-config-fluid": "^0.23.0",
     "@mixer/webpack-bundle-compare": "^0.1.0",
     "@types/compression": "0.0.33",
@@ -167,7 +167,7 @@
     "html-loader": "^0.5.5",
     "less": "~3.9.0",
     "mocha": "^8.4.0",
-    "node-sass": "^4.9.3",
+    "node-sass": "^5.0.0",
     "nyc": "^15.0.0",
     "parallel-webpack": "^2.3.0",
     "rimraf": "^2.6.2",

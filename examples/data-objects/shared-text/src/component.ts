@@ -9,7 +9,6 @@ import * as url from "url";
 import registerDebug from "debug";
 import { controls, ui } from "@fluid-example/client-ui-lib";
 import { TextAnalyzer } from "@fluid-example/intelligence-runner-agent";
-import * as API from "@fluid-internal/client-api";
 import { IAgentScheduler } from "@fluidframework/agent-scheduler";
 import { SharedCell } from "@fluidframework/cell";
 import { performance } from "@fluidframework/common-utils";
@@ -19,7 +18,6 @@ import {
     IFluidLoadable,
     IRequest,
     IResponse,
-    IFluidRouter,
 } from "@fluidframework/core-interfaces";
 import { FluidDataStoreRuntime, FluidObjectHandle, mixinRequestHandler } from "@fluidframework/datastore";
 import {
@@ -35,20 +33,15 @@ import {
     SharedObjectSequence,
     SharedString,
 } from "@fluidframework/sequence";
-import { requestFluidObject, RequestParser, create404Response } from "@fluidframework/runtime-utils";
+import {
+    RequestParser,
+    create404Response,
+} from "@fluidframework/runtime-utils";
 import { IFluidHTMLView } from "@fluidframework/view-interfaces";
-import { Document } from "./document";
+import { SharedTextDocument } from "./document";
 import { downloadRawText, getInsights, setTranslation } from "./utils";
 
 const debug = registerDebug("fluid:shared-text");
-
-/**
- * Helper function to retrieve the handle for the default component route
- */
-async function getHandle(runtimeP: Promise<IFluidRouter>): Promise<IFluidHandle> {
-    const component = await requestFluidObject(await runtimeP, "");
-    return component.IFluidLoadable.handle;
-}
 
 export class SharedTextRunner
     extends EventEmitter
@@ -56,9 +49,10 @@ export class SharedTextRunner
     public static async load(
         runtime: FluidDataStoreRuntime,
         context: IFluidDataStoreContext,
+        existing: boolean,
     ): Promise<SharedTextRunner> {
         const runner = new SharedTextRunner(runtime, context);
-        await runner.initialize();
+        await runner.initialize(existing);
 
         return runner;
     }
@@ -74,7 +68,7 @@ export class SharedTextRunner
     private sharedString: SharedString;
     private insightsMap: ISharedMap;
     private rootView: ISharedMap;
-    private collabDoc: Document;
+    private sharedTextDocument: SharedTextDocument;
     private uiInitialized = false;
     private readonly title: string = "Shared Text";
 
@@ -111,21 +105,21 @@ export class SharedTextRunner
         }
     }
 
-    private async initialize(): Promise<void> {
-        this.collabDoc = await Document.load(this.runtime);
-        this.rootView = this.collabDoc.getRoot();
+    private async initialize(existing: boolean): Promise<void> {
+        this.sharedTextDocument = await SharedTextDocument.load(this.runtime, existing);
+        this.rootView = this.sharedTextDocument.getRoot();
 
-        if (!this.runtime.existing) {
+        if (!existing) {
             const insightsMapId = "insights";
 
-            const insights = this.collabDoc.createMap(insightsMapId);
+            const insights = this.sharedTextDocument.createMap(insightsMapId);
             this.rootView.set(insightsMapId, insights.handle);
 
             debug(`Not existing ${this.runtime.id} - ${performance.now()}`);
-            this.rootView.set("users", this.collabDoc.createMap().handle);
-            const seq = SharedNumberSequence.create(this.collabDoc.runtime);
+            this.rootView.set("users", this.sharedTextDocument.createMap().handle);
+            const seq = SharedNumberSequence.create(this.sharedTextDocument.runtime);
             this.rootView.set("sequence-test", seq.handle);
-            const newString = this.collabDoc.createString();
+            const newString = this.sharedTextDocument.createString();
 
             const template = parse(window.location.search.substr(1)).template;
             const starterText = template
@@ -145,25 +139,14 @@ export class SharedTextRunner
             }
             this.rootView.set("text", newString.handle);
 
-            const containerRuntime = this.context.containerRuntime;
-            const [progressBars, math, images] = await Promise.all([
-                getHandle(containerRuntime.createDataStore("@fluid-example/progress-bars")),
-                getHandle(containerRuntime.createDataStore("@fluid-example/math")),
-                getHandle(containerRuntime.createDataStore("@fluid-example/image-collection")),
-            ]);
-
-            this.rootView.set("progressBars", progressBars);
-            this.rootView.set("math", math);
-            this.rootView.set("images", images);
-
-            insights.set(newString.id, this.collabDoc.createMap().handle);
+            insights.set(newString.id, this.sharedTextDocument.createMap().handle);
 
             // The flowContainerMap MUST be set last
 
-            const flowContainerMap = this.collabDoc.createMap();
+            const flowContainerMap = this.sharedTextDocument.createMap();
             this.rootView.set("flowContainerMap", flowContainerMap.handle);
 
-            insights.set(newString.id, this.collabDoc.createMap().handle);
+            insights.set(newString.id, this.sharedTextDocument.createMap().handle);
         }
 
         debug(`collabDoc loaded ${this.runtime.id} - ${performance.now()}`);
@@ -185,10 +168,11 @@ export class SharedTextRunner
 
         const options = parse(window.location.search.substr(1));
         setTranslation(
-            this.collabDoc,
+            this.sharedTextDocument,
             this.sharedString.id,
             options.translationFromLanguage as string,
-            options.translationToLanguage as string)
+            options.translationToLanguage as string,
+            existing)
             .catch((error) => {
                 console.error("Problem adding translation", error);
             });
@@ -209,7 +193,6 @@ export class SharedTextRunner
         require("bootstrap/dist/css/bootstrap-theme.min.css");
         require("../stylesheets/map.css");
         require("../stylesheets/style.css");
-        require("katex/dist/katex.min.css");
         /* eslint-enable @typescript-eslint/no-require-imports,
         import/no-internal-modules, import/no-unassigned-import */
 
@@ -227,12 +210,8 @@ export class SharedTextRunner
         const container = new controls.FlowContainer(
             containerDiv,
             this.title,
-            // API.Document should not be used here. This should be removed once #2915 is fixed.
-            new API.Document(
-                this.runtime,
-                this.context,
-                this.rootView,
-                () => { throw new Error("Can't close document"); }),
+            this.runtime,
+            this.context,
             this.sharedString,
             image,
             {});
@@ -291,21 +270,25 @@ class TaskScheduler {
     }
 }
 
-export function instantiateDataStore(context: IFluidDataStoreContext) {
+export function instantiateDataStore(context: IFluidDataStoreContext, existing: boolean) {
     const runtimeClass = mixinRequestHandler(
         async (request: IRequest) => {
             const router = await routerP;
             return router.request(request);
         });
 
-    const runtime = new runtimeClass(context, new Map([
-        SharedMap.getFactory(),
-        SharedString.getFactory(),
-        SharedCell.getFactory(),
-        SharedObjectSequence.getFactory(),
-        SharedNumberSequence.getFactory(),
-    ].map((factory) => [factory.type, factory])));
-    const routerP = SharedTextRunner.load(runtime, context);
+    const runtime = new runtimeClass(
+        context,
+        new Map([
+            SharedMap.getFactory(),
+            SharedString.getFactory(),
+            SharedCell.getFactory(),
+            SharedObjectSequence.getFactory(),
+            SharedNumberSequence.getFactory(),
+        ].map((factory) => [factory.type, factory])),
+        existing,
+    );
+    const routerP = SharedTextRunner.load(runtime, context, existing);
 
     return runtime;
 }

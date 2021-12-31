@@ -8,7 +8,6 @@ import {
     AttachState,
     ContainerWarning,
     IDeltaManager,
-    ILoader,
     ILoaderOptions,
 } from "@fluidframework/container-definitions";
 import {
@@ -48,14 +47,10 @@ export interface IProvideContainerRuntime {
 export interface IContainerRuntimeEvents extends IContainerRuntimeBaseEvents {
     (event: "codeDetailsProposed", listener: (codeDetails: IFluidCodeDetails, proposal: IPendingProposal) => void);
     (
-        event: "dirtyDocument" | "dirty" | "disconnected" | "dispose" | "savedDocument" | "saved",
+        event: "dirty" | "disconnected" | "dispose" | "saved" | "attached",
         listener: () => void);
     (event: "connected", listener: (clientId: string) => void);
     (event: "localHelp", listener: (message: IHelpMessage) => void);
-    (
-        event: "fluidDataStoreInstantiated",
-        listener: (dataStorePkgName: string, registryPath: string, createNew: boolean) => void,
-    );
 }
 
 export type IContainerRuntimeBaseWithCombinedEvents =
@@ -69,18 +64,12 @@ export interface IContainerRuntime extends
     IProvideFluidDataStoreRegistry,
     IContainerRuntimeBaseWithCombinedEvents {
     readonly id: string;
-    readonly existing: boolean;
     readonly options: ILoaderOptions;
     readonly clientId: string | undefined;
     readonly clientDetails: IClientDetails;
     readonly connected: boolean;
     readonly deltaManager: IDeltaManager<ISequencedDocumentMessage, IDocumentMessage>;
     readonly storage: IDocumentStorageService;
-    /**
-     * @deprecated 0.37 Containers created using a loader will make automatically it
-     * available through scope instead
-     */
-    readonly loader: ILoader;
     readonly flushMode: FlushMode;
     readonly scope: IFluidObject;
     /**
@@ -117,13 +106,9 @@ export interface IContainerRuntime extends
 
     /**
      * Used to raise an unrecoverable error on the runtime.
+     * @deprecated Warnings are being deprecated
      */
     raiseContainerWarning(warning: ContainerWarning): void;
-
-    /**
-     * @deprecated - Please use isDirty()
-     */
-    isDocumentDirty(): boolean;
 
     /**
      * Returns true of document is dirty, i.e. there are some pending local changes that

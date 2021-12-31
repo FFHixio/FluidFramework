@@ -5,11 +5,12 @@
 
 import { ITelemetryLogger } from "@fluidframework/common-definitions";
 import { PerformanceEvent } from "@fluidframework/telemetry-utils";
-import { IOdspUrlParts, TokenFetchOptions } from "@fluidframework/odsp-driver-definitions";
+import { InstrumentedStorageTokenFetcher, IOdspUrlParts } from "@fluidframework/odsp-driver-definitions";
 import { ISocketStorageDiscovery } from "./contracts";
 import { getWithRetryForTokenRefresh, getOrigin } from "./odspUtils";
 import { getApiRoot } from "./odspUrlHelper";
 import { EpochTracker } from "./epochTracker";
+import { runWithRetry } from "./retryUtils";
 
 interface IJoinSessionBody {
     requestSocketToken?: boolean;
@@ -36,7 +37,7 @@ export async function fetchJoinSession(
     path: string,
     method: string,
     logger: ITelemetryLogger,
-    getStorageToken: (options: TokenFetchOptions, name: string) => Promise<string | null>,
+    getStorageToken: InstrumentedStorageTokenFetcher,
     epochTracker: EpochTracker,
     requestSocketToken: boolean,
     guestDisplayName?: string,
@@ -71,14 +72,21 @@ export async function fetchJoinSession(
                     if (guestDisplayName) {
                         body.guestDisplayName = guestDisplayName;
                     }
+                    // IMPORTANT: Must set content-type header explicitly to application/json when request has body.
+                    // By default, request will use text/plain as content-type and will be rejected by backend.
+                    headers["Content-Type"] = "application/json";
                 }
 
-                const response = await epochTracker.fetchAndParseAsJSON<ISocketStorageDiscovery>(
-                    `${getApiRoot(siteOrigin)}/drives/${
-                        urlParts.driveId
-                    }/items/${urlParts.itemId}/${path}?${queryParams}`,
-                    { method, headers, body: body ? JSON.stringify(body) : undefined },
+                const response = await runWithRetry(
+                    async () => epochTracker.fetchAndParseAsJSON<ISocketStorageDiscovery>(
+                        `${getApiRoot(siteOrigin)}/drives/${
+                            urlParts.driveId
+                        }/items/${urlParts.itemId}/${path}?${queryParams}`,
+                        { method, headers, body: body ? JSON.stringify(body) : undefined },
+                        "joinSession",
+                    ),
                     "joinSession",
+                    logger,
                 );
 
                 // TODO SPO-specific telemetry
